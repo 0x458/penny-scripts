@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# TEMPLATE ONLY - renting costs money; run only after the user approves. Replace every <...> placeholder.
+# Pitfalls baked in: Entrypoint mode (args start with exec; --raw BEFORE --args; --args LAST); no --ssh/--direct
+# (Fedora image has no apt-get -> Vast's sshd injection fails -> instance stopped); env/args are frozen at create
+# (update/reboot do not apply new env; only recycle does, and it wipes the disk) - scripts come from the repo instead.
+set -euo pipefail
+GEO=${GEO:-JP}                      # search by region + GPU, then pick by id; `search offers "id=..."` is unreliable
+vastai search offers "num_gpus=1 disk_space>=500 cpu_ram>=128 reliability>0.98 geolocation=$GEO rentable=true" -o 'dph+' --raw > /tmp/offers.json
+python3 - <<'PY'
+import json
+for o in json.load(open("/tmp/offers.json")):
+    g = o.get("gpu_name", "")
+    if "PRO 6000" in g and "Max-Q" not in g:            # Max-Q = 300 W version, exclude by name
+        print(o["id"], o.get("machine_id"), g, f'{o["dph_total"]:.3f}$/h', f'ram={int(o["cpu_ram"]/1000)}GB',
+              f'disk={int(o["disk_space"])}GB', o.get("driver_version"), o.get("geolocation"))
+PY
+OFFER_ID=${OFFER_ID:?set OFFER_ID from the list above}
+RAM_GB=${RAM_GB:?set RAM_GB = that offer ram= value (caps HiCache; cgroup limit is NOT the rental)}
+BOOT_B64=$(base64 -w0 bootstrap.sh)
+# shellcheck disable=SC2016  # $PENNY_BOOTSTRAP_B64 must expand inside the container, not here
+vastai create instance "$OFFER_ID" \
+  --image ghcr.io/jpezzulli/sglang-rtxpro6000:v3.0.2 \
+  --disk 500 \
+  --env "-p 8001:8001 -p 8002:8002 -e PENNY_API_KEY=<PENNY_API_KEY> -e PENNY_REPO_URL=https://github.com/0x458/<REPO>.git -e PENNY_REPO_REF=main -e GH_TOKEN=<GH_TOKEN_READONLY> -e PENNY_RAM_GB=$RAM_GB -e PENNY_MODE=plain -e PENNY_BOOTSTRAP_B64=$BOOT_B64" \
+  --raw \
+  --args exec bash -c 'echo "$PENNY_BOOTSTRAP_B64" | base64 -d > /cache/bootstrap.sh && exec bash /cache/bootstrap.sh'
+# Optional extras inside --env: -e TS_AUTHKEY=<TS_AUTHKEY> -e TS_TAGS=tag:<tag>   (Tailscale; skipped when unset)
+#                               -e PENNY_BOOT_B64=$(base64 -w0 boot.sh) -e PENNY_CTL_B64=$(base64 -w0 ctl.py)  (offline fallback)
+# The --raw output contains instance_api_key: do not paste it anywhere.
+# Later: change scripts -> push to the repo branch -> `vastai reboot instance <ID>` (re-runs bootstrap, keeps /cache incl. model).
+# If you ever need `vastai update instance`, it must include --image ghcr.io/jpezzulli/sglang-rtxpro6000:v3.0.2 (else HTTP 400).

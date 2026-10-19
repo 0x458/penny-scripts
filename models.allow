@@ -1,0 +1,6 @@
+# Whitelist for ctl.py POST /switch. One "org/repo@<40-hex commit>" per line. Lives in the repo, so edit +
+# reboot (bootstrap re-pulls) changes it without recreating the instance. All three have tokenizer.json
+# sha256 0997f410... (passes the FR-Spec check), 135.25 GB each (HF API, 2026-10-19).
+jpezzulli/OrcaRouter-Qwen3.8-Flash-Next-Uncensored-ModelOpt-NVFP4@f24d2b68ff2814f24455ae86717be276619b5664
+dealignai/Qwen3.8-Flash-Next-ABLITERATED-NVFP4@be794b990578ef3031eccf9f28e675a289a09ee9
+RadixArk/Qwen3.8-Flash-Next-NVFP4@7b719225242aacd3dbd3f9407468c2ee9a9d2594
