@@ -7,6 +7,12 @@ open(os.environ["FAKE_ARGV_OUT"], "a").write(json.dumps(a) + "\n")
 print(f"server_args=ServerArgs(model_path='{g('--model-path')}', api_key='{g('--api-key')}', hicache_size={g('--hicache-size')}, "
       f"speculative_token_map={g('--speculative-token-map')!r})", flush=True)
 print(f"[fake-sglang] api key again on stderr: {g('--api-key')}", file=sys.stderr, flush=True)
+cf = os.environ.get("FAKE_CRASH_FILE")
+if cf and os.path.exists(cf):
+    n = int(open(cf).read() or 0)
+    if n > 0:
+        open(cf, "w").write(str(n - 1)); import time; time.sleep(1)
+        print("[fake-sglang] simulated crash", flush=True); sys.exit(3)
 signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
 class H(http.server.BaseHTTPRequestHandler):
     def log_message(self, *x): pass

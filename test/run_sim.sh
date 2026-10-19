@@ -30,12 +30,15 @@ BARE=$W/remote.git; git init -q --bare "$BARE"; SRC=$W/src; mkdir -p "$SRC"
 cp -r "$V5/boot.sh" "$V5/ctl.py" "$V5/bootstrap.sh" "$V5/models.allow" "$V5/upstream" "$SRC/"
 git -C "$SRC" init -q -b main && git -C "$SRC" add -A && git -C "$SRC" -c user.email=t@t -c user.name=t commit -qm v5 && git -C "$SRC" push -q "$BARE" main
 SHA=$(git -C "$SRC" rev-parse HEAD)
+git -C "$SRC" -c user.email=t@t -c user.name=t tag -a v5.1 -m v5.1 && git -C "$SRC" push -q "$BARE" v5.1
 URL=https://github.com/0x458/penny-scripts.git
 printf '[url "%s"]\n\tinsteadOf = %s\n' "$BARE" "$URL" > "$C/.gitconfig"   # bootstrap sets HOME=$C; maps the https URL to the local bare repo
 
-export PENNY_CACHE=$C CACHE_BASE=$C PENNY_REPO_URL=$URL PENNY_REPO_REF=$SHA PENNY_API_KEY=$KEY GH_TOKEN=$GHT PENNY_RAM_GB=189 \
+export PENNY_CACHE=$C CACHE_BASE=$C PENNY_REPO_URL=$URL PENNY_REPO_REF=v5.1 PENNY_API_KEY=$KEY GH_TOKEN=$GHT PENNY_RAM_GB=189 \
   PENNY_PY=python3 PENNY_HF_BIN=$T/fake_hf.sh HF_ENDPOINT=http://127.0.0.1:18080 REPO_ROOT=$R PENNY_CTL_PORT=18002 \
-  PENNY_ALLOW_FILE=$W/allow.test FAKE_ARGV_OUT=$W/argv.jsonl FAKE_HF_DATA=$H FAKE_HF_LOG=$W/hf.log PENNY_DISK_RESERVE_GB=1
+  PENNY_ALLOW_FILE=$W/allow.test FAKE_ARGV_OUT=$W/argv.jsonl FAKE_HF_DATA=$H FAKE_HF_LOG=$W/hf.log PENNY_DISK_RESERVE_GB=1 \
+  PENNY_DL_RETRY_DELAY=1 PENNY_RESTART_DELAY=1 PENNY_MAX_RESTARTS=3 FAKE_HF_FLAKY_DIR=$W/flaky FAKE_CRASH_FILE=$W/crash
+mkdir -p "$W/flaky"; touch "$W/flaky/OrcaRouter-Qwen3.8-Flash-Next-Uncensored-ModelOpt-NVFP4"   # first Orca download comes back incomplete
 PENNY_BOOTSTRAP_B64=$(base64 -w0 "$V5/bootstrap.sh"); export PENNY_BOOTSTRAP_B64
 python3 "$T/fake_hf_api.py" 18080 & APIPID=$!
 trap 'kill $APIPID 2>/dev/null; pkill -f "$W/" 2>/dev/null' EXIT
@@ -51,7 +54,9 @@ bash -c 'echo "$PENNY_BOOTSTRAP_B64" | base64 -d > "$PENNY_CACHE/bootstrap.sh" &
 BOOT=$!
 chk "server up in plain mode (default)" waitphase serving:plain
 grep "PENNY" "$W/container.log" | sed "s|$W|\$W|g" | head -12
-chk "scripts fetched from repo at pinned sha" grep -q "fetched $URL@$SHA -> $SHA" "$C/logs/bootstrap.log"
+chk "scripts fetched from repo at tag v5.1 (= $SHA)" grep -q "fetched $URL@v5.1 -> $SHA" "$C/logs/bootstrap.log"
+chk "incomplete download retried (attempt 1 failed: incomplete)" grep -q "download attempt 1 failed (incomplete" "$W/container.log"
+chk "second attempt completed -> .complete" grep -q "model download done" "$W/container.log"
 chk "download used pinned revision f24d2b68" grep -q -- "--revision f24d2b68ff2814f24455ae86717be276619b5664" "$W/hf.log"
 chk ".complete written with spec" grep -q "$ORCA" "$C/models/OrcaRouter-Qwen3.8-Flash-Next-Uncensored-ModelOpt-NVFP4/.complete"
 chk "frspec tokenizer check ok on Orca" grep -q "tokenizer_frspec_ok=True" "$W/container.log"
@@ -96,6 +101,18 @@ chk "server process alive (rc null)" bash -c "curl -s -H 'Authorization: Bearer 
 chk "frspec start file passed upstream tokenizer check" grep -q "Verifying the pinned FR-Spec map, tokenizer" "$C/logs/server-frspec.log"
 curl -s -X POST "${A[@]}" "$CTL/mode?m=plain"; echo
 chk "back to plain" waitphase serving:plain
+[[ $(grep -c "SGLang exited" "$W/container.log") == 0 ]] && ok "intentional stops (mode switches) not counted as crashes" || bad "mode switch counted as crash"
+
+echo "=== 4b. crash -> limited auto-restart"
+echo 2 > "$W/crash"; N=$(nargv); curl -s -X POST "${A[@]}" "$CTL/mode?m=plain" >/dev/null
+for _ in $(seq 40); do st | grep -q '"restarts": 2' && st | grep -q '"phase": "serving:plain"' && st | grep -q '"rc": null' && break; sleep 1; done
+st | grep -q '"restarts": 2' && ok "2 crashes -> 2 automatic restarts, now serving: $(grep -c 'SGLang exited rc=3; restart' "$W/container.log") restart lines" || bad "restart: $(st)"
+echo 9 > "$W/crash"; curl -s -X POST "${A[@]}" "$CTL/mode?m=plain" >/dev/null
+for _ in $(seq 40); do st | grep -q '"phase": "crashed' && break; sleep 1; done
+st | grep -q '"phase": "crashed rc=3"' && ok "crash loop stops after 3 restarts: $(st | python3 -c 'import json,sys;print(json.load(sys.stdin)["err"])')" || bad "crash loop: $(st)"
+rm -f "$W/crash"; curl -s -X POST "${A[@]}" "$CTL/mode?m=plain" >/dev/null
+for _ in $(seq 20); do st | grep -q '"restarts": 0' && st | grep -q '"phase": "serving:plain"' && break; sleep 1; done
+st | grep -q '"restarts": 0' && ok "manual /mode resets restart budget and serves again" || bad "reset: $(st)"
 
 echo "=== 5. whitelist switch"
 N=$(nargv); curl -s -X POST "${A[@]}" "$CTL/switch?model=$DEAL&m=plain"; echo
@@ -120,6 +137,8 @@ C2=$W/c2; mkdir -p "$C2"; cp -r "$C/penny-vast" "$C2/"
 PENNY_CACHE=$C2 PENNY_RAM_GB=128 PENNY_CTL_PORT=18003 timeout 5 bash "$C2/penny-vast/boot.sh" > "$W/c2.log" 2>&1
 chk "RAM 128 -> HICACHE_SIZE_GB=28" grep -q '^HICACHE_SIZE_GB=28$' "$C2/start-plain.sh"
 grep "HiCache" "$W/c2.log"
+env -u PENNY_RAM_GB PENNY_CACHE="$C2" timeout 5 bash "$C2/penny-vast/boot.sh" > "$W/c4.log" 2>&1; rc=$?
+[[ $rc != 0 ]] && grep -q "FATAL PENNY_RAM_GB is required" "$W/c4.log" && ok "PENNY_RAM_GB unset -> refuses to start (rc=$rc)" || bad "ram unset rc=$rc"
 PENNY_CACHE=$C2 PENNY_RAM_GB=100 timeout 5 bash "$C2/penny-vast/boot.sh" > "$W/c3.log" 2>&1; rc=$?
 [[ $rc != 0 ]] && grep -q "too small" "$W/c3.log" && ok "RAM 100 -> refuses to start (rc=$rc): $(grep FATAL "$W/c3.log")" || bad "ram 100 rc=$rc"
 pkill -f "c2/penny-vast/ctl.py" 2>/dev/null; pkill -f "$R/.venv/bin/sglang" 2>/dev/null
@@ -143,4 +162,23 @@ grep -q "using embedded" "$W/b7c.log" && ok "embedded PENNY_BOOT_B64/PENNY_CTL_B
 # 7d http URL refused
 PENNY_REPO_URL=http://example.com/x.git bash "$C/bootstrap.sh" > "$W/b7d.log" 2>&1 && bad "http accepted" || ok "non-https repo URL refused"
 kill $APIPID 2>/dev/null
+echo "=== 8. vast search query (offline parse with the installed vastai CLI parser; no API call)"
+VPY=/home/box/.local/share/pipx/venvs/vastai/bin/python
+# shellcheck disable=SC2016
+QUERY=$(sed -n 's/^QUERY="\(.*\)"$/\1/p' "$V5/vast/create-instance.sh.example" | sed 's/\$GEO/JP/')
+if [[ -x $VPY ]]; then
+  PQ=$("$VPY" -c 'import json,sys
+from vastai.api.query import parse_query, offers_fields, offers_alias, offers_mult
+print(json.dumps(parse_query(sys.argv[1], {"verified":{"eq":True},"external":{"eq":False},"rentable":{"eq":True}}, offers_fields, offers_alias, offers_mult)))' "$QUERY")
+  echo "$PQ"
+  echo "$PQ" | grep -q '"gpu_ram": {"gte": 90000.0}' && ok "gpu_ram>=90 parsed (x1000 -> MB)" || bad gpu_ram
+  echo "$PQ" | grep -q '"verified"' && bad "verified filter still present" || ok "verified=any removes the default verified=true"
+  grep -q -- "--limit 200" "$V5/vast/create-instance.sh.example" && grep -q '"Max-Q" not in g' "$V5/vast/create-instance.sh.example" && ok "template: --limit 200 + python Max-Q exclusion" || bad template
+  grep -q "PENNY_REPO_REF=v5.1" "$V5/vast/create-instance.sh.example" && grep -q "PENNY_REPO_REF=v5.1\|v5.1" "$V5/README.md" && ! grep -q "PENNY_REPO_REF=main" "$V5/vast/create-instance.sh.example" "$V5/README.md" && ok "template + README pin tag v5.1" || bad "tag alignment"
+else echo "SKIP vastai CLI not installed"; fi
+
+echo "=== 9. tailscale block"
+TSOUT=$(bash "$T/ts_test.sh" "$V5/boot.sh"); echo "$TSOUT" | grep -E "^\[|RESULT"
+TP=$(echo "$TSOUT" | sed -n 's/^=== TS RESULT: \([0-9]*\) passed, \([0-9]*\) failed/\1/p'); TF=$(echo "$TSOUT" | sed -n 's/^=== TS RESULT: \([0-9]*\) passed, \([0-9]*\) failed/\2/p')
+PASS=$((PASS + TP)); FAIL=$((FAIL + TF))
 echo "=== RESULT: $PASS passed, $FAIL failed (workdir $W)"

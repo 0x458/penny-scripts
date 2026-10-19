@@ -9,7 +9,10 @@ ROOT = os.path.realpath(os.environ.get("PENNY_MODELS_ROOT", C + "/models"))
 PORT = int(os.environ.get("PENNY_CTL_PORT", "8002"))
 HF = os.environ.get("HF_ENDPOINT", "https://huggingface.co").rstrip("/")
 HF_BIN = os.environ.get("PENNY_HF_BIN", "/opt/pennyroyal/.venv/bin/hf")
-RETRIES = max(1, int(os.environ.get("PENNY_DL_RETRIES", "4")))
+RETRIES = max(1, int(os.environ.get("PENNY_DL_RETRIES", "4")))           # network errors and incomplete downloads
+RETRY_DELAY = float(os.environ.get("PENNY_DL_RETRY_DELAY", "30"))        # seconds, x attempt number
+MAX_RESTARTS = int(os.environ.get("PENNY_MAX_RESTARTS", "3"))            # automatic restarts after a crash, per manual launch
+RESTART_DELAY = float(os.environ.get("PENNY_RESTART_DELAY", "20"))
 RESERVE_GB = float(os.environ.get("PENNY_DISK_RESERVE_GB", "40"))  # JIT caches + logs
 ALLOW_FILE = os.environ.get("PENNY_ALLOW_FILE", os.path.join(os.path.dirname(os.path.abspath(__file__)), "models.allow"))
 DEFAULT = "jpezzulli/OrcaRouter-Qwen3.8-Flash-Next-Uncensored-ModelOpt-NVFP4@f24d2b68ff2814f24455ae86717be276619b5664"
@@ -47,14 +50,16 @@ a0 = rd(C + "/active"); a0 = a0 if not valid(a0) else os.environ.get("PENNY_MODE
 if valid(a0): print(f"PENNY: PENNY_MODEL {a0!r} rejected ({valid(a0)}), using default", flush=True); a0 = DEFAULT
 m0 = rd(C + "/mode") or os.environ.get("PENNY_MODE", "plain")      # Chinese is ~46% faster without FR-Spec
 st = {"mode": m0 if m0 in ("frspec", "plain") else "plain", "active": a0, "proc": None, "started": None, "phase": "boot",
-      "job": None, "err": None}
+      "job": None, "err": None, "restarts": 0}
 lock = threading.Lock()
 
 def pump(p, path):
     with open(path, "ab") as f:
         for line in iter(p.stdout.readline, b""):
             line = line.replace(KEYB, MASK); f.write(line); f.flush(); sys.stdout.buffer.write(line); sys.stdout.flush()
-def launch():
+def launch(manual=True):
+    """Caller holds lock. manual=True (boot/switch/mode) resets the crash-restart budget."""
+    if manual: st["restarts"] = 0
     m, a = st["mode"], st["active"]
     if m == "frspec" and not tok_ok(a): m = st["mode"] = "plain"; st["err"] = "tokenizer fails FR-Spec check; using plain"
     path = f"{LOG}/server-{m}.log"
@@ -64,16 +69,30 @@ def launch():
     p = subprocess.Popen(["bash", f"{START}/start-{m}.sh"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True, env=env)
     st.update(proc=p, started=time.time(), phase="serving:" + m)
     threading.Thread(target=pump, args=(p, path), daemon=True).start()
+    threading.Thread(target=watch, args=(p,), daemon=True).start()
     print(f"PENNY: launched {m} {a} pid {p.pid}", flush=True)
+def watch(p):
+    """Restart SGLang a limited number of times if it exits on its own. stop() clears st["proc"] first, so an
+    intentional stop (switch/mode) is never counted as a crash."""
+    rc = p.wait()
+    if st["proc"] is not p: return
+    if st["restarts"] >= MAX_RESTARTS:
+        st.update(phase=f"crashed rc={rc}", err=f"SGLang exited rc={rc}; gave up after {st['restarts']} restarts")
+        print(f"PENNY: ERROR SGLang exited rc={rc}, restart budget ({MAX_RESTARTS}) used up", flush=True); return
+    st["phase"] = f"restarting rc={rc}"
+    print(f"PENNY: SGLang exited rc={rc}; restart {st['restarts']+1}/{MAX_RESTARTS} in {RESTART_DELAY:g}s", flush=True)
+    time.sleep(RESTART_DELAY)
+    with lock:
+        if st["proc"] is not p: return          # a switch/mode happened meanwhile
+        st["restarts"] += 1; launch(manual=False)
 def stop():
-    p = st["proc"]
+    p = st["proc"]; st["proc"] = None            # clear first: watch() then knows this exit is intentional
     if p and p.poll() is None:
         os.killpg(p.pid, signal.SIGTERM)
         for _ in range(90):
             if p.poll() is not None: break
             time.sleep(1)
         else: os.killpg(p.pid, signal.SIGKILL); p.wait()
-    st["proc"] = None
 def du(p):
     t = 0
     for r, _, fs in os.walk(p):
@@ -117,8 +136,8 @@ def job(spec, mode):
     try:
         for i in range(RETRIES):
             err = download(spec)
-            if not err or not err.startswith(("HF metadata", "downloader")) or i == RETRIES - 1: break
-            print(f"PENNY: download attempt {i+1} failed ({err}); retry in {30*(i+1)}s", flush=True); time.sleep(30 * (i + 1))
+            if not err or not err.startswith(("HF metadata", "downloader", "incomplete")) or i == RETRIES - 1: break
+            print(f"PENNY: download attempt {i+1} failed ({err}); retry in {RETRY_DELAY*(i+1):g}s", flush=True); time.sleep(RETRY_DELAY * (i + 1))
         if err: st.update(err=err, phase="error" if st["proc"] is None else st["phase"]); print("PENNY: ERROR " + err, flush=True); return
         with lock:
             stop(); st.update(active=spec, mode=mode, err=None); open(C + "/active", "w").write(spec); open(C + "/mode", "w").write(mode); launch()
@@ -143,7 +162,7 @@ class H(http.server.BaseHTTPRequestHandler):
         if u.path == "/status":
             p = st["proc"]; d = shutil.disk_usage(ROOT)
             self.out(200, {"phase": st["phase"], "mode": st["mode"], "active": st["active"], "job": st["job"], "err": st["err"],
-                "pid": p and p.pid, "rc": p and p.poll(), "up_s": st["started"] and round(time.time() - st["started"]),
+                "pid": p and p.pid, "rc": p and p.poll(), "restarts": st["restarts"], "up_s": st["started"] and round(time.time() - st["started"]),
                 "model_bytes": du(mdir(st["active"])), "disk_used_gb": round(d.used/1e9, 1), "disk_free_gb": round(d.free/1e9, 1),
                 "mem": open("/proc/meminfo").read().splitlines()[:3]})
         elif u.path == "/models":

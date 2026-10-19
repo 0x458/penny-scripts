@@ -2,7 +2,7 @@
 # Penny v5 boot (Penny Royal v3.0.2 + jpezzulli Orca NVFP4 @f24d2b68 on one RTX PRO 6000).
 # Prepares both start files (plain = default, frspec) from the pinned upstream copies, optional Tailscale,
 # then runs ctl.py (:8002), which downloads the pinned model, writes .complete and starts SGLang (:8001).
-# Env: PENNY_API_KEY (required), PENNY_RAM_GB (rented RAM from the offer, caps HiCache), optional
+# Env: PENNY_API_KEY (required), PENNY_RAM_GB (required: rented RAM from the offer, caps HiCache), optional
 #      PENNY_HICACHE_GB, PENNY_MODE (plain|frspec), PENNY_MODEL (must be in models.allow), TS_AUTHKEY, TS_TAGS.
 set -euo pipefail
 C=${PENNY_CACHE:-/cache}
@@ -25,10 +25,7 @@ echo "PENNY: boot v5 $(date -u) scripts=$(cat "$D/.penny-head" 2>/dev/null || ec
 # PENNY_RAM_GB. Budget: RAM PLE ~51 GB + process/pinned buffers ~40 GB => HiCache <= RAM - 100, max 48.
 WANT=${PENNY_HICACHE_GB:-48}
 RAM=${PENNY_RAM_GB:-}
-if [[ -z $RAM ]]; then
-  RAM=$(awk '/MemTotal/{printf "%d", $2/1e6}' /proc/meminfo)
-  echo "PENNY: WARN PENNY_RAM_GB unset; using MemTotal ${RAM} GB (may be the host's, not the rental)"
-fi
+[[ -n $RAM ]] || { echo "PENNY: FATAL PENNY_RAM_GB is required (the offer's RAM in GB; the cgroup/MemTotal value is not the rental)" >&2; exit 1; }
 [[ $WANT =~ ^[1-9][0-9]{0,3}$ && $RAM =~ ^[1-9][0-9]{0,4}$ ]] || { echo "PENNY: FATAL bad PENNY_HICACHE_GB/PENNY_RAM_GB" >&2; exit 1; }
 HICACHE_GB=$(( RAM - 100 < WANT ? RAM - 100 : WANT ))
 (( HICACHE_GB >= 8 )) || { echo "PENNY: FATAL rented RAM ${RAM} GB too small (need >=108 GB for PLE + HiCache)" >&2; exit 1; }
@@ -59,30 +56,42 @@ done
 echo "PENNY: start files ready (frspec, plain)"
 
 # Optional Tailscale (userspace; image has no root/TUN). Only with TS_AUTHKEY; key passed via a 0600 file, not argv.
-if [[ -n ${TS_AUTHKEY:-} ]]; then
-  TS=$C/ts; mkdir -p "$TS/state"
-  (
-    set -e
-    if [[ ! -x $TS/tailscaled ]]; then
-      V=$(curl -fsSL 'https://pkgs.tailscale.com/stable/?mode=json' | "$PY" -c 'import json,sys;print(json.load(sys.stdin)["TarballsVersion"])')
-      curl -fsSL "https://pkgs.tailscale.com/stable/tailscale_${V}_amd64.tgz" -o "$TS/ts.tgz"
-      "$PY" -c 'import sys,tarfile,os,shutil
-t=tarfile.open(sys.argv[1])
+# Every step returns explicitly: set -e does NOT apply inside a function/subshell used in an if/|| context.
+# Failure is only a WARN - Penny keeps running on the public ports.
+ts_up() {
+  local TS=$1 V i state="" polls=${PENNY_TS_POLL:-30}
+  if [[ ! -x $TS/tailscaled || ! -x $TS/tailscale ]]; then
+    V=$(curl -fsSL --retry 3 'https://pkgs.tailscale.com/stable/?mode=json' | "$PY" -c 'import json,sys;print(json.load(sys.stdin)["TarballsVersion"])') || { echo "PENNY: tailscale version lookup failed"; return 1; }
+    [[ $V =~ ^[0-9][0-9.]*$ ]] || { echo "PENNY: bad tailscale version '$V'"; return 1; }
+    curl -fsSL --retry 3 "https://pkgs.tailscale.com/stable/tailscale_${V}_amd64.tgz" -o "$TS/ts.tgz" || { echo "PENNY: tailscale download failed"; return 1; }
+    "$PY" -c 'import sys,tarfile,os,shutil
+t=tarfile.open(sys.argv[1]); n=0
 for m in t.getmembers():
     b=os.path.basename(m.name)
     if b in ("tailscale","tailscaled") and m.isfile():
         with t.extractfile(m) as s, open(os.path.join(sys.argv[2],b),"wb") as o: shutil.copyfileobj(s,o)
-        os.chmod(os.path.join(sys.argv[2],b),0o755)' "$TS/ts.tgz" "$TS"
-    fi
-    nohup "$TS/tailscaled" --tun=userspace-networking --statedir="$TS/state" --socket="$TS/sock" > "$C/logs/tailscaled.log" 2>&1 &
-    sleep 3
-    umask 077; printf '%s' "$TS_AUTHKEY" > "$TS/authkey"
-    "$TS/tailscale" --socket="$TS/sock" up --hostname="${TS_HOSTNAME:-vast-penny}" --auth-key="file:$TS/authkey" ${TS_TAGS:+--advertise-tags="$TS_TAGS"}
-    rm -f "$TS/authkey"
-    "$TS/tailscale" --socket="$TS/sock" serve --bg --tcp 8000 tcp://127.0.0.1:8001
-    echo "PENNY: tailscale up + serve tcp 8000 ok"
-  ) || echo "PENNY: WARN tailscale failed (public ports 8001/8002 still work)"
-  rm -f "$TS/authkey"
+        os.chmod(os.path.join(sys.argv[2],b),0o755); n+=1
+sys.exit(0 if n==2 else 1)' "$TS/ts.tgz" "$TS" || { echo "PENNY: tailscale unpack failed"; return 1; }
+  fi
+  nohup "$TS/tailscaled" --tun=userspace-networking --statedir="$TS/state" --socket="$TS/sock" > "$C/logs/tailscaled.log" 2>&1 &
+  for ((i = 0; i < polls; i++)); do [[ -S $TS/sock ]] && break; sleep 1; done
+  [[ -S $TS/sock ]] || { echo "PENNY: tailscaled socket did not appear in ${polls}s"; return 1; }
+  ( umask 077; printf '%s' "$TS_AUTHKEY" > "$TS/authkey" ) || return 1
+  "$TS/tailscale" --socket="$TS/sock" up --timeout=120s --hostname="${TS_HOSTNAME:-vast-penny}" --auth-key="file:$TS/authkey" ${TS_TAGS:+--advertise-tags="$TS_TAGS"}
+  i=$?; rm -f "$TS/authkey"
+  (( i == 0 )) || { echo "PENNY: tailscale up failed rc=$i"; return 1; }
+  for ((i = 0; i < polls; i++)); do
+    state=$("$TS/tailscale" --socket="$TS/sock" status --json 2>/dev/null | grep -oE '"BackendState":[[:space:]]*"[A-Za-z]+"' | grep -oE '[A-Za-z]+"$' | tr -d '"')
+    [[ $state == Running ]] && break; sleep 2
+  done
+  [[ $state == Running ]] || { echo "PENNY: tailscale BackendState=${state:-unknown}, not Running"; return 1; }
+  "$TS/tailscale" --socket="$TS/sock" serve --bg --tcp 8000 tcp://127.0.0.1:8001 || { echo "PENNY: tailscale serve failed"; return 1; }
+  echo "PENNY: tailscale up + serve tcp 8000 ok (BackendState=Running)"
+}
+if [[ -n ${TS_AUTHKEY:-} ]]; then
+  mkdir -p "$C/ts/state"
+  ts_up "$C/ts" || echo "PENNY: WARN tailscale failed (public ports 8001/8002 still work)"
+  rm -f "$C/ts/authkey"
 else
   echo "PENNY: TS_AUTHKEY unset, skipping tailscale"
 fi
