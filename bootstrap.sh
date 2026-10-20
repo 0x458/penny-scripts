@@ -30,17 +30,27 @@ kill_tree() {
   for c in $(ps -o pid= --ppid "$pid" 2>/dev/null); do kill_tree "$c"; done
   kill -TERM "$pid" 2>/dev/null || true
 }
+# pennyroyal-v3.0.2 auth.py allows every path starting with /health even when --api-key is set, so this
+# request carries no key. curl -f treats 401 as failure. The key must not appear in argv or this log.
 sglang_healthy() { curl -fsS -m 2 "http://127.0.0.1:${PENNY_SGLANG_PORT:-8001}/health" >/dev/null 2>&1; }
-mark_good() { # $1 = directory that contains boot.sh
+# Replace dest with dest.new without deleting dest first. A failed second mv puts dest.old back.
+swap_in() {
+  local dest=$1
+  rm -rf "$dest.old"
+  if [[ -e $dest ]]; then mv "$dest" "$dest.old"; fi
+  if mv "$dest.new" "$dest"; then rm -rf "$dest.old"; return 0; fi
+  [[ -e $dest.old ]] && mv "$dest.old" "$dest"
+  return 1
+}
+mark_good() { # $1 = directory that contains boot.sh; its .penny-ref is the only ref this records
   local ref dest=$C/penny-vast-good
-  ref=$(head -n 1 "$C/penny-ref" 2>/dev/null | tr -d '[:space:]')
-  [[ -n $ref ]] || ref=${PENNY_REPO_REF:-}
+  [[ -f $1/.penny-ref ]] || { log "WARN no .penny-ref in scripts; not recording penny-ref-good"; return 0; }
+  ref=$(head -n 1 "$1/.penny-ref" | tr -d '[:space:]')
   [[ -n $ref ]] || return 0
   rm -rf "$dest.new"
   mkdir -p "$dest.new"
   cp -a "$1/." "$dest.new/"
-  rm -rf "$dest"
-  mv "$dest.new" "$dest"
+  swap_in "$dest" || return 1
   atomic_line "$C/penny-ref-good" "$ref" || return 1
   log "recorded good ref $ref"
 }
@@ -91,6 +101,8 @@ for i in 1 2 3; do
   if fetch && rm -rf "$D" && mv "$NEW" "$D" && atomic_line "$C/penny-ref" "$REF"; then
     log "fetched $REPO_URL@$REF -> $(cat "$D/.penny-head")"
     SRC=$D/$SUB
+    # The installed tree's own ref. Cache/embedded fallback must not inherit /cache/penny-ref.
+    atomic_line "$SRC/.penny-ref" "$REF" || log "WARN could not write .penny-ref"
     FETCHED=1
     break
   fi
@@ -102,6 +114,7 @@ fi
 if [[ -z ${SRC:-} && -n ${PENNY_BOOT_B64:-} && -n ${PENNY_CTL_B64:-} ]]; then
   SRC=$C/penny-embedded; mkdir -p "$SRC"
   echo "$PENNY_BOOT_B64" | base64 -d > "$SRC/boot.sh" && echo "$PENNY_CTL_B64" | base64 -d > "$SRC/ctl.py" || exit 1
+  atomic_line "$SRC/.penny-ref" "embedded" || log "WARN could not write .penny-ref"
   log "WARN: using embedded PENNY_BOOT_B64/PENNY_CTL_B64 (upstream start files come from GitHub raw)"
 fi
 [[ -n ${SRC:-} ]] || { log "FATAL: no scripts (fetch failed, no cache, no embedded copy)"; exit 1; }

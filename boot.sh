@@ -141,6 +141,9 @@ unset TS_AUTHKEY
 
 # Record the ref only after SGLang answers /health. PENNY_SUPERVISED=1 means bootstrap.sh is watching
 # that check and will roll back; this process just becomes ctl.py.
+# pennyroyal-v3.0.2 (python/sglang/srt/utils/auth.py) allows every path starting with /health
+# even when --api-key is set, so this request carries no key. curl -f treats 401 as not healthy.
+# The key stays out of argv and out of this log.
 sglang_healthy() { curl -fsS -m 2 "http://127.0.0.1:${PENNY_SGLANG_PORT:-8001}/health" >/dev/null 2>&1; }
 atomic_line() {
   local tmp
@@ -148,21 +151,28 @@ atomic_line() {
   printf '%s\n' "$2" > "$tmp" || { rm -f "$tmp"; return 1; }
   mv -f "$tmp" "$1"
 }
-current_ref() {
+# Only the ref written into this script tree. /cache/penny-ref can name a tag that failed to fetch.
+script_ref() {
   local r=""
-  [[ -f $C/penny-ref ]] && r=$(head -n 1 "$C/penny-ref" | tr -d '[:space:]')
-  [[ -n $r ]] || r=${PENNY_REPO_REF:-}
+  [[ -f $D/.penny-ref ]] && r=$(head -n 1 "$D/.penny-ref" | tr -d '[:space:]')
   printf '%s' "$r"
+}
+swap_in() {
+  local dest=$1
+  rm -rf "$dest.old"
+  if [[ -e $dest ]]; then mv "$dest" "$dest.old"; fi
+  if mv "$dest.new" "$dest"; then rm -rf "$dest.old"; return 0; fi
+  [[ -e $dest.old ]] && mv "$dest.old" "$dest"
+  return 1
 }
 mark_good() {
   local ref dest=$C/penny-vast-good
-  ref=$(current_ref)
-  [[ -n $ref ]] || return 0
+  ref=$(script_ref)
+  [[ -n $ref ]] || { echo "PENNY: WARN scripts have no .penny-ref; leaving penny-ref-good unchanged"; return 0; }
   rm -rf "$dest.new"
   mkdir -p "$dest.new"
   cp -a "$D/." "$dest.new/"
-  rm -rf "$dest"
-  mv "$dest.new" "$dest"
+  swap_in "$dest"
   atomic_line "$C/penny-ref-good" "$ref"
   echo "PENNY: recorded good ref $ref"
 }
@@ -187,7 +197,7 @@ for ((i = 0; i < tout; i++)); do
   fi
   sleep 1
 done
-echo "PENNY: WARN SGLang /health not ready after ${tout}s (ref $(current_ref)); leaving ctl running"
+echo "PENNY: WARN SGLang /health not ready after ${tout}s (scripts ref $(script_ref)); leaving ctl running"
 trap - TERM INT
 wait "$pid"
 exit $?

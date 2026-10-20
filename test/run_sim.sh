@@ -80,6 +80,7 @@ chk "WARN public HTTP without Tailscale" grep -q "WARN ports 8001/8002 are publi
 chk "ctl bound 0.0.0.0" grep -q "ctl listening 0.0.0.0:18002" "$W/container.log"
 for _ in $(seq 30); do [[ -f $C/penny-ref-good && -f $C/penny-vast-good/boot.sh ]] && grep -qx v5.1 "$C/penny-ref-good" && break; sleep 1; done
 grep -qx v5.1 "$C/penny-ref-good" && [[ -f $C/penny-vast-good/boot.sh ]] && ! compgen -G "$C/penny-ref-good.*" >/dev/null && ok "recorded good ref v5.1 and script snapshot" || bad "penny-ref-good $(cat "$C/penny-ref-good" 2>/dev/null)"
+grep -qx v5.1 "$C/penny-vast/.penny-ref" && ok "fetched tree records .penny-ref v5.1" || bad ".penny-ref $(cat "$C/penny-vast/.penny-ref" 2>/dev/null)"
 grep -qx "$ORCA" "$C/active" && grep -qx plain "$C/mode" && ! [[ -e $C/active.tmp || -e $C/mode.tmp ]] && ok "active and mode written atomically" || bad "active/mode files"
 
 echo "=== 2. api key masking"
@@ -194,6 +195,7 @@ rm -rf "$C/penny-vast"; env -u PENNY_API_KEY bash "$C/bootstrap.sh" > "$W/b7b.lo
 # 7c embedded fallback
 PENNY_BOOT_B64=$(base64 -w0 "$V5/boot.sh") PENNY_CTL_B64=$(base64 -w0 "$V5/ctl.py") env -u PENNY_API_KEY bash "$C/bootstrap.sh" > "$W/b7c.log" 2>&1
 grep -q "using embedded" "$W/b7c.log" && ok "embedded PENNY_BOOT_B64/PENNY_CTL_B64 fallback used" || bad 7c
+grep -qx embedded "$C/penny-embedded/.penny-ref" && ok "embedded fallback writes .penny-ref=embedded" || bad "embedded .penny-ref"
 # 7d http URL refused
 PENNY_REPO_URL=http://example.com/x.git bash "$C/bootstrap.sh" > "$W/b7d.log" 2>&1 && bad "http accepted" || ok "non-https repo URL refused"
 printf '[url "%s"]\n\tinsteadOf = %s\n' "$BARE" "$URL" > "$C/.gitconfig"
@@ -221,6 +223,20 @@ kill_desc() { local p=$1 c; [[ -n ${p:-} ]] || return 0; for c in $(ps -o pid= -
 stop_rb() { kill_desc "$RBPID"; sleep 1; kill -KILL "$RBPID" 2>/dev/null || true; wait "$RBPID" 2>/dev/null || true; for _ in $(seq 20); do curl -fsS -m 1 http://127.0.0.1:8001/health >/dev/null 2>&1 || return 0; sleep 0.5; done; return 1; }
 stop_rb || bad "sglang still up before bad-tag test"
 MODSUM=$(cd "$RB/models" && find . -type f -print | sort | xargs sha256sum)
+# /upgrade recorded a tag that is not on origin. Fetch fails, cached v5.1 scripts serve, penny-ref-good stays v5.1.
+printf '%s\n' v9.9 > "$RB/penny-ref"
+env -u FAKE_CRASH_FILE PENNY_CACHE=$RB PENNY_REPO_REF=v5.1 PENNY_CTL_PORT=18012 \
+  FAKE_ARGV_OUT=$W/argv-rb.jsonl FAKE_HF_LOG=$W/hf-rb.log \
+  bash "$V5/bootstrap.sh" > "$W/rb-miss.log" 2>&1 &
+RBPID=$!
+kept=0
+for _ in $(seq 70); do
+  if grep -q 'using cached copy' "$W/rb-miss.log" && grep -qx v5.1 "$RB/penny-ref-good" && grep -qx v5.1 "$RB/penny-vast/.penny-ref" && curl -fsS -m 1 http://127.0.0.1:8001/health >/dev/null 2>&1; then kept=1; break; fi
+  sleep 1
+done
+[[ $kept == 1 ]] && grep -qx v9.9 "$RB/penny-ref" && ! grep -qx v9.9 "$RB/penny-ref-good" && ! grep -q 'recorded good ref v9.9' "$W/rb-miss.log" && ok "missing tag keeps penny-ref-good at the cached ref" || bad "miss tag: good=$(cat "$RB/penny-ref-good" 2>/dev/null) tree=$(cat "$RB/penny-vast/.penny-ref" 2>/dev/null) $(tail -8 "$W/rb-miss.log" | tr '\n' '|')"
+grep -qF -- "$KEY" "$W/rb-miss.log" "$RB/penny-ref-good" "$RB/penny-vast/.penny-ref" && bad "API key in ref fallback logs" || ok "API key absent from ref fallback"
+stop_rb || bad "sglang still up after missing-tag fallback"
 git -C "$SRC" checkout -q -B badref 'v5.1^{}'
 printf '%s\n' '#!/bin/bash' 'echo "PENNY: bad boot"' 'exit 1' > "$SRC/boot.sh"
 chmod +x "$SRC/boot.sh"
@@ -265,6 +281,25 @@ if grep -q . "$W/hf-rb.log"; then bad "health-timeout rollback re-downloaded the
 stop_rb || true
 pkill -f "$RB" 2>/dev/null || true
 kill $APIPID 2>/dev/null
+echo "=== 7g. /health with an api key"
+python3 -c '
+import http.server
+class H(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def do_GET(self):
+        self.send_response(401); self.end_headers()
+http.server.HTTPServer(("127.0.0.1", 18099), H).serve_forever()
+' >/dev/null 2>&1 &
+HPID=$!
+ready=0
+for _ in $(seq 25); do code=$(curl -s -o /dev/null -m 1 -w '%{http_code}' http://127.0.0.1:18099/health || true); [[ $code == 401 ]] && ready=1 && break; sleep 0.2; done
+[[ $ready == 1 ]] && ok "probe saw /health 401" || bad "401 probe"
+curl -fsS -m 2 http://127.0.0.1:18099/health >/dev/null 2>&1 && bad "401 /health counted healthy" || ok "/health 401 is not healthy"
+kill "$HPID" 2>/dev/null || true
+wait "$HPID" 2>/dev/null || true
+hl=$(grep -h '^sglang_healthy()' "$V5/boot.sh" "$V5/bootstrap.sh")
+[[ $(printf '%s\n' "$hl" | grep -c 'curl -fsS ') == 2 ]] && ! printf '%s\n' "$hl" | grep -E -q 'PENNY_API_KEY|Authorization' && ok "health check sends no API key" || bad "health check line: $hl"
+
 echo "=== 8. vast search query (offline parse with the installed vastai CLI parser; no API call)"
 VPY=/home/box/.local/share/pipx/venvs/vastai/bin/python
 # shellcheck disable=SC2016

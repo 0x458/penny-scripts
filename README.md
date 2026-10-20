@@ -11,8 +11,11 @@ Model pinned: `jpezzulli/OrcaRouter-Qwen3.8-Flash-Next-Uncensored-ModelOpt-NVFP4
    3 tries; then cached copy from the last boot (`/cache/penny-vast`); then embedded `PENNY_BOOT_B64`+`PENNY_CTL_B64`;
    else `FATAL` + exit 1. Unsets GH_TOKEN. A failed fetch keeps the cached scripts and the model.
    After SGLang answers `GET /health`, the running ref is stored in `/cache/penny-ref-good` and the script tree is
-   copied to `/cache/penny-vast-good`. A later ref that exits or never becomes healthy is put back automatically
-   (see Recovery). The model directory is not part of that copy.
+   copied to `/cache/penny-vast-good`. That ref is the `.penny-ref` file inside the script tree (written on a
+   successful fetch, or `embedded` for the embedded fallback). A cache fallback keeps the cached tree's
+   `.penny-ref`; it does not copy the tag that failed to fetch out of `/cache/penny-ref`. A later ref that exits
+   or never becomes healthy is put back automatically (see Recovery). The model directory is not part of that copy.
+   SGLang in this image allows `/health` without the API key (`auth.py` prefixes `/health`), so the check sends no key.
 3. `boot.sh` checks sha256 of the vendored upstream start files (`upstream/`, identical to tag pennyroyal-v3.0.2),
    patches them (model dir from `$PENNY_MODEL_DIR`, `NIXL=off`, HiCache and context from the environment,
    `--host` from `PENNY_BIND_HOST`, `--served-model-name flash-next --api-key`),
