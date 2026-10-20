@@ -6,6 +6,8 @@
 #      PENNY_MODEL, TS_AUTHKEY, TS_TAGS (default empty; --advertise-tags only when set),
 #      PENNY_PUBLIC_BIND=1 (keep 0.0.0.0 even when Tailscale is up).
 # After first boot, /cache/config.json and /cache/penny-ref win over the frozen Vast env.
+# A healthy SGLang (/health) records the running ref in /cache/penny-ref-good and snapshots the scripts.
+# bootstrap.sh rolls a new ref back to that snapshot when SGLang does not come up. The model stays put.
 set -euo pipefail
 C=${PENNY_CACHE:-/cache}
 export HOME=$C PENNY_CACHE=$C
@@ -83,7 +85,7 @@ echo "PENNY: start files ready (frspec, plain)"
 # Vast -p cannot target the tailnet (no TUN). When Tailscale is up, bind 127.0.0.1 and serve both ports unless
 # PENNY_PUBLIC_BIND=1. Without TS_AUTHKEY, bind 0.0.0.0 and WARN. A failed Tailscale stays on 0.0.0.0.
 ts_up() {
-  local TS=$1 V i state="" polls=${PENNY_TS_POLL:-30}
+  local TS=$1 V i state="" polls=${PENNY_TS_POLL:-30} tout=${PENNY_TS_TIMEOUT:-150}
   if [[ ! -x $TS/tailscaled || ! -x $TS/tailscale ]]; then
     V=$(curl -fsSL --retry 3 'https://pkgs.tailscale.com/stable/?mode=json' | "$PY" -c 'import json,sys;print(json.load(sys.stdin)["TarballsVersion"])') || { echo "PENNY: tailscale version lookup failed"; return 1; }
     [[ $V =~ ^[0-9][0-9.]*$ ]] || { echo "PENNY: bad tailscale version '$V'"; return 1; }
@@ -105,7 +107,7 @@ sys.exit(0 if n==2 else 1)' "$TS/ts.tgz" "$TS" || { echo "PENNY: tailscale unpac
   local -a up_cmd
   up_cmd=(--socket="$TS/sock" up --timeout=120s --hostname="${TS_HOSTNAME:-vast-penny}" --auth-key="file:$TS/authkey")
   if [[ -n ${TS_TAGS:-} ]]; then up_cmd+=(--advertise-tags="$TS_TAGS"); fi
-  "$TS/tailscale" "${up_cmd[@]}"
+  timeout "$tout" "$TS/tailscale" "${up_cmd[@]}"
   i=$?; rm -f "$TS/authkey"
   (( i == 0 )) || { echo "PENNY: tailscale up failed rc=$i"; return 1; }
   for ((i = 0; i < polls; i++)); do
@@ -113,8 +115,8 @@ sys.exit(0 if n==2 else 1)' "$TS/ts.tgz" "$TS" || { echo "PENNY: tailscale unpac
     [[ $state == Running ]] && break; sleep 2
   done
   [[ $state == Running ]] || { echo "PENNY: tailscale BackendState=${state:-unknown}, not Running"; return 1; }
-  "$TS/tailscale" --socket="$TS/sock" serve --bg --tcp 8000 tcp://127.0.0.1:8001 || { echo "PENNY: tailscale serve failed"; return 1; }
-  "$TS/tailscale" --socket="$TS/sock" serve --bg --tcp 8002 tcp://127.0.0.1:8002 || { echo "PENNY: tailscale serve failed"; return 1; }
+  timeout "$tout" "$TS/tailscale" --socket="$TS/sock" serve --bg --tcp 8000 tcp://127.0.0.1:8001 || { echo "PENNY: tailscale serve failed"; return 1; }
+  timeout "$tout" "$TS/tailscale" --socket="$TS/sock" serve --bg --tcp 8002 tcp://127.0.0.1:8002 || { echo "PENNY: tailscale serve failed"; return 1; }
   echo "PENNY: tailscale up + serve tcp 8000 ok (BackendState=Running)"
 }
 export PENNY_BIND_HOST=0.0.0.0
@@ -128,7 +130,7 @@ if [[ -n ${TS_AUTHKEY:-} ]]; then
       echo "PENNY: bind 127.0.0.1 only (tailnet tcp/8000 -> :8001, tcp/8002 -> :8002)"
     fi
   else
-    echo "PENNY: WARN tailscale failed (binding 0.0.0.0; public only if -p 8001/8002 is published)"
+    echo "PENNY: WARN tailscale up/serve failed within the timeout; binding 0.0.0.0. This line is in vastai logs <id>. TAILNET=1 publishes no -p, so this fallback is unreachable from outside the container. Recovery: fix Tailscale, then vastai reboot instance <id> (disk and model stay)."
   fi
   rm -f "$C/ts/authkey"
 else
@@ -136,4 +138,56 @@ else
   echo "PENNY: WARN ports 8001/8002 are public plain HTTP"
 fi
 unset TS_AUTHKEY
-exec "$PY" "$D/ctl.py"
+
+# Record the ref only after SGLang answers /health. PENNY_SUPERVISED=1 means bootstrap.sh is watching
+# that check and will roll back; this process just becomes ctl.py.
+sglang_healthy() { curl -fsS -m 2 "http://127.0.0.1:${PENNY_SGLANG_PORT:-8001}/health" >/dev/null 2>&1; }
+atomic_line() {
+  local tmp
+  tmp=$(mktemp "$1.XXXXXX") || return 1
+  printf '%s\n' "$2" > "$tmp" || { rm -f "$tmp"; return 1; }
+  mv -f "$tmp" "$1"
+}
+current_ref() {
+  local r=""
+  [[ -f $C/penny-ref ]] && r=$(head -n 1 "$C/penny-ref" | tr -d '[:space:]')
+  [[ -n $r ]] || r=${PENNY_REPO_REF:-}
+  printf '%s' "$r"
+}
+mark_good() {
+  local ref dest=$C/penny-vast-good
+  ref=$(current_ref)
+  [[ -n $ref ]] || return 0
+  rm -rf "$dest.new"
+  mkdir -p "$dest.new"
+  cp -a "$D/." "$dest.new/"
+  rm -rf "$dest"
+  mv "$dest.new" "$dest"
+  atomic_line "$C/penny-ref-good" "$ref"
+  echo "PENNY: recorded good ref $ref"
+}
+kill_tree() {
+  local pid=$1 c
+  [[ -n ${pid:-} ]] || return 0
+  for c in $(ps -o pid= --ppid "$pid" 2>/dev/null); do kill_tree "$c"; done
+  kill -TERM "$pid" 2>/dev/null || true
+}
+if [[ ${PENNY_SUPERVISED:-} == 1 ]]; then exec "$PY" "$D/ctl.py"; fi
+"$PY" "$D/ctl.py" &
+pid=$!
+trap 'kill_tree "$pid"; kill -KILL "$pid" 2>/dev/null || true; exit 143' TERM INT
+tout=${PENNY_HEALTH_TIMEOUT:-1800}
+for ((i = 0; i < tout; i++)); do
+  if ! kill -0 "$pid" 2>/dev/null; then wait "$pid"; exit $?; fi
+  if sglang_healthy; then
+    mark_good
+    trap - TERM INT
+    wait "$pid"
+    exit $?
+  fi
+  sleep 1
+done
+echo "PENNY: WARN SGLang /health not ready after ${tout}s (ref $(current_ref)); leaving ctl running"
+trap - TERM INT
+wait "$pid"
+exit $?

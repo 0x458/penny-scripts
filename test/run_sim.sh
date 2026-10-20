@@ -3,6 +3,7 @@
 # Full-flow simulation of the v5 scripts with stubs (no GPU, no real model, no Vast). Usage: bash test/run_sim.sh /path/to/fakeroot
 # fakeroot = upstream configs/pennyroyal/* from pennyroyal-v3.0.2 (chat template, FR-Spec map, adaptive config, helpers).
 set -uo pipefail
+unset TS_AUTHKEY TS_TAGS GH_TOKEN
 V5=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd); T=$V5/test
 UPCFG=${1:?fakeroot with configs/pennyroyal}; TOK=${2:?real tokenizer.json (sha 0997f410...)}
 W=$(mktemp -d /tmp/pv5sim.XXXX); C=$W/cache; mkdir -p "$C"
@@ -77,6 +78,9 @@ chk "NIXL off message in server log" grep -q "NIXL disk tier: off" "$C/logs/serv
 chk "tailscale skipped without TS_AUTHKEY" grep -q "TS_AUTHKEY unset, skipping tailscale" "$W/container.log"
 chk "WARN public HTTP without Tailscale" grep -q "WARN ports 8001/8002 are public plain HTTP" "$W/container.log"
 chk "ctl bound 0.0.0.0" grep -q "ctl listening 0.0.0.0:18002" "$W/container.log"
+for _ in $(seq 30); do [[ -f $C/penny-ref-good && -f $C/penny-vast-good/boot.sh ]] && grep -qx v5.1 "$C/penny-ref-good" && break; sleep 1; done
+grep -qx v5.1 "$C/penny-ref-good" && [[ -f $C/penny-vast-good/boot.sh ]] && ! compgen -G "$C/penny-ref-good.*" >/dev/null && ok "recorded good ref v5.1 and script snapshot" || bad "penny-ref-good $(cat "$C/penny-ref-good" 2>/dev/null)"
+grep -qx "$ORCA" "$C/active" && grep -qx plain "$C/mode" && ! [[ -e $C/active.tmp || -e $C/mode.tmp ]] && ok "active and mode written atomically" || bad "active/mode files"
 
 echo "=== 2. api key masking"
 chk "fake SGLang really printed server_args (masked)" grep -q "api_key='<API_KEY>'" "$W/container.log"
@@ -193,8 +197,73 @@ grep -q "using embedded" "$W/b7c.log" && ok "embedded PENNY_BOOT_B64/PENNY_CTL_B
 # 7d http URL refused
 PENNY_REPO_URL=http://example.com/x.git bash "$C/bootstrap.sh" > "$W/b7d.log" 2>&1 && bad "http accepted" || ok "non-https repo URL refused"
 printf '[url "%s"]\n\tinsteadOf = %s\n' "$BARE" "$URL" > "$C/.gitconfig"
-env -u PENNY_API_KEY bash "$C/bootstrap.sh" > "$W/b7e.log" 2>&1 || true
+env -u PENNY_API_KEY timeout 60 bash "$C/bootstrap.sh" > "$W/b7e.log" 2>&1 || true
 grep -q "recorded ref v5.2 overrides env PENNY_REPO_REF=v5.1" "$C/logs/bootstrap.log" && grep -q "fetched $URL@v5.2 -> $SHA2" "$W/b7e.log" && ok "reboot fetches recorded tag v5.2 ($SHA2), not the frozen env" || bad "ref override: $(grep -E 'recorded ref|fetched' "$W/b7e.log" | tail -5)"
+
+echo "=== 7f. bad tag rolls back to penny-ref-good; model files stay"
+RB=$W/rb; rm -rf "$RB"; mkdir -p "$RB"
+cp -a "$C/models" "$RB/models"
+[[ -f $C/config.json ]] && cp -a "$C/config.json" "$RB/config.json"
+printf '[url "%s"]\n\tinsteadOf = %s\n' "$BARE" "$URL" > "$RB/.gitconfig"
+pkill -f "$R/.venv/bin/sglang" 2>/dev/null || true
+sleep 1
+env -u FAKE_CRASH_FILE PENNY_CACHE=$RB PENNY_REPO_REF=v5.1 PENNY_CTL_PORT=18012 \
+  FAKE_ARGV_OUT=$W/argv-rb.jsonl FAKE_HF_LOG=$W/hf-rb.log \
+  bash "$V5/bootstrap.sh" > "$W/rb-good.log" 2>&1 &
+RBPID=$!
+good=0
+for _ in $(seq 60); do
+  if [[ -f $RB/penny-ref-good ]] && grep -qx v5.1 "$RB/penny-ref-good" && curl -fsS -m 1 http://127.0.0.1:8001/health >/dev/null 2>&1; then good=1; break; fi
+  sleep 1
+done
+[[ $good == 1 ]] && ok "side boot recorded penny-ref-good v5.1" || bad "side boot: $(tail -8 "$W/rb-good.log" | tr '\n' '|')"
+kill_desc() { local p=$1 c; [[ -n ${p:-} ]] || return 0; for c in $(ps -o pid= --ppid "$p" 2>/dev/null); do kill_desc "$c"; done; kill -TERM "$p" 2>/dev/null || true; }
+stop_rb() { kill_desc "$RBPID"; sleep 1; kill -KILL "$RBPID" 2>/dev/null || true; wait "$RBPID" 2>/dev/null || true; for _ in $(seq 20); do curl -fsS -m 1 http://127.0.0.1:8001/health >/dev/null 2>&1 || return 0; sleep 0.5; done; return 1; }
+stop_rb || bad "sglang still up before bad-tag test"
+MODSUM=$(cd "$RB/models" && find . -type f -print | sort | xargs sha256sum)
+git -C "$SRC" checkout -q -B badref 'v5.1^{}'
+printf '%s\n' '#!/bin/bash' 'echo "PENNY: bad boot"' 'exit 1' > "$SRC/boot.sh"
+chmod +x "$SRC/boot.sh"
+git -C "$SRC" add boot.sh && git -C "$SRC" -c user.email=t@t -c user.name=t commit -qm bad-exit
+git -C "$SRC" -c user.email=t@t -c user.name=t tag -f v9.1 && git -C "$SRC" push -q "$BARE" refs/tags/v9.1
+printf '%s\n' '#!/bin/bash' 'echo "PENNY: hang boot"' 'sleep 300' > "$SRC/boot.sh"
+git -C "$SRC" add boot.sh && git -C "$SRC" -c user.email=t@t -c user.name=t commit -qm bad-hang
+git -C "$SRC" -c user.email=t@t -c user.name=t tag -f v9.2 && git -C "$SRC" push -q "$BARE" refs/tags/v9.2
+printf '%s\n' v9.1 > "$RB/penny-ref"
+env -u FAKE_CRASH_FILE PENNY_CACHE=$RB PENNY_REPO_REF=v5.1 PENNY_CTL_PORT=18012 \
+  FAKE_ARGV_OUT=$W/argv-rb.jsonl FAKE_HF_LOG=$W/hf-rb.log \
+  bash "$V5/bootstrap.sh" > "$W/rb-bad.log" 2>&1 &
+RBPID=$!
+rolled=0
+for _ in $(seq 40); do
+  if grep -q 'rolled back to v5.1' "$RB/logs/bootstrap.log" && grep -qx v5.1 "$RB/penny-ref" && curl -fsS -m 1 http://127.0.0.1:8001/health >/dev/null 2>&1; then rolled=1; break; fi
+  sleep 1
+done
+[[ $rolled == 1 ]] && ok "exit-1 tag rolls back to v5.1 and SGLang is healthy" || bad "rollback exit: penny-ref=$(cat "$RB/penny-ref" 2>/dev/null) $(tail -6 "$W/rb-bad.log" | tr '\n' '|')"
+grep -qx v5.1 "$RB/penny-ref-good" && ok "failed tag did not replace penny-ref-good" || bad "good ref overwritten: $(cat "$RB/penny-ref-good" 2>/dev/null)"
+MODSUM2=$(cd "$RB/models" && find . -type f -print | sort | xargs sha256sum)
+[[ $MODSUM == "$MODSUM2" ]] && ok "rollback left model files unchanged" || bad "model files changed"
+if [[ -f $W/hf-rb.log ]] && grep -q . "$W/hf-rb.log"; then bad "model was downloaded again"; else ok "rollback did not re-download the model"; fi
+grep -q 'no recycle' "$RB/logs/bootstrap.log" && ok "rollback log says no recycle" || bad "no recycle wording"
+stop_rb || bad "sglang still up before hang-tag test"
+: > "$W/hf-rb.log"
+printf '%s\n' v9.2 > "$RB/penny-ref"
+env -u FAKE_CRASH_FILE PENNY_CACHE=$RB PENNY_REPO_REF=v5.1 PENNY_CTL_PORT=18012 PENNY_HEALTH_TIMEOUT=4 \
+  FAKE_ARGV_OUT=$W/argv-rb.jsonl FAKE_HF_LOG=$W/hf-rb.log \
+  bash "$V5/bootstrap.sh" > "$W/rb-hang.log" 2>&1 &
+RBPID=$!
+rolled=0
+for _ in $(seq 40); do
+  if grep -q 'rolled back to v5.1' "$W/rb-hang.log" && grep -qx v5.1 "$RB/penny-ref" && curl -fsS -m 1 http://127.0.0.1:8001/health >/dev/null 2>&1; then rolled=1; break; fi
+  sleep 1
+done
+[[ $rolled == 1 ]] && ok "health timeout rolls back to v5.1" || bad "rollback hang: penny-ref=$(cat "$RB/penny-ref" 2>/dev/null) $(tail -6 "$W/rb-hang.log" | tr '\n' '|')"
+grep -qx v5.1 "$RB/penny-ref-good" && ok "hung tag did not replace penny-ref-good" || bad "good ref after hang $(cat "$RB/penny-ref-good" 2>/dev/null)"
+MODSUM3=$(cd "$RB/models" && find . -type f -print | sort | xargs sha256sum)
+[[ $MODSUM == "$MODSUM3" ]] && ok "health-timeout rollback left model files unchanged" || bad "model files changed after hang"
+if grep -q . "$W/hf-rb.log"; then bad "health-timeout rollback re-downloaded the model"; else ok "health-timeout rollback did not re-download the model"; fi
+stop_rb || true
+pkill -f "$RB" 2>/dev/null || true
 kill $APIPID 2>/dev/null
 echo "=== 8. vast search query (offline parse with the installed vastai CLI parser; no API call)"
 VPY=/home/box/.local/share/pipx/venvs/vastai/bin/python
@@ -214,6 +283,9 @@ grep -q "PENNY_RAM_GB=189" "$V5/vast/create-instance.sh.example" && ok "template
 grep -q "reliability>=0.99" "$V5/vast/create-instance.sh.example" && grep -q "cpu_ram>=180 cpu_ram<=200" "$V5/vast/create-instance.sh.example" && grep -q "PRO 6000 S" "$V5/vast/create-instance.sh.example" && grep -q -- "--type on-demand" "$V5/vast/create-instance.sh.example" && grep -q 'GEO=${GEO:-JP}' "$V5/vast/create-instance.sh.example" && ok "template selects JP, PRO 6000 S, on-demand, ~189 GB, reliability >= 0.99" || bad "offer filter"
 ENVLINE=$(sed -n '/--env /p' "$V5/vast/create-instance.sh.example")
 printf '%s\n' "$ENVLINE" | grep -q -- '-e TS_TAGS= ' && ! printf '%s\n' "$ENVLINE" | grep -E -q 'TS_TAGS=[^[:space:]"$]' && ! printf '%s\n' "$ENVLINE" | grep -q -- '--advertise-tags' && ok "template TS_TAGS left empty" || bad "TS_TAGS template"
+grep -q 'def atomic_write' "$V5/ctl.py" && ! grep -E 'open\(C \+ "/active"|open\(C\+"/mode"|open\(C \+ "/mode"' "$V5/ctl.py" && ok "ctl.py writes mode and active with atomic_write" || bad "atomic_write"
+grep -q 'unset TS_AUTHKEY TS_TAGS GH_TOKEN' "$0" "$T/ts_test.sh" && ok "test scripts unset TS_AUTHKEY TS_TAGS GH_TOKEN" || bad "test unset"
+grep -q 'verified=false' "$V5/README.md" && grep -q 'penny-ref-good' "$V5/README.md" && grep -q 'vastai logs' "$V5/README.md" && grep -q 'vastai reboot instance' "$V5/README.md" && grep -q 'TAILNET=1' "$V5/README.md" && grep -q 'no recycle' "$V5/README.md" && ok "README documents verified=false and both recovery flows" || bad "README recovery"
 
 echo "=== 9. tailscale block"
 TSOUT=$(bash "$T/ts_test.sh" "$V5/boot.sh"); echo "$TSOUT" | grep -E "^\[|RESULT"

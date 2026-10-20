@@ -10,6 +10,9 @@ Model pinned: `jpezzulli/OrcaRouter-Qwen3.8-Flash-Next-Uncensored-ModelOpt-NVFP4
    `GIT_CONFIG_*` env, never in argv/URL/.git/config/logs. A `vN.N` ref must exist as `refs/tags/…` before checkout.
    3 tries; then cached copy from the last boot (`/cache/penny-vast`); then embedded `PENNY_BOOT_B64`+`PENNY_CTL_B64`;
    else `FATAL` + exit 1. Unsets GH_TOKEN. A failed fetch keeps the cached scripts and the model.
+   After SGLang answers `GET /health`, the running ref is stored in `/cache/penny-ref-good` and the script tree is
+   copied to `/cache/penny-vast-good`. A later ref that exits or never becomes healthy is put back automatically
+   (see Recovery). The model directory is not part of that copy.
 3. `boot.sh` checks sha256 of the vendored upstream start files (`upstream/`, identical to tag pennyroyal-v3.0.2),
    patches them (model dir from `$PENNY_MODEL_DIR`, `NIXL=off`, HiCache and context from the environment,
    `--host` from `PENNY_BIND_HOST`, `--served-model-name flash-next --api-key`),
@@ -26,15 +29,17 @@ Model pinned: `jpezzulli/OrcaRouter-Qwen3.8-Flash-Next-Uncensored-ModelOpt-NVFP4
   in `/cache/models`. Changing them does not need a new instance or `vastai recycle` (recycle wipes the disk).
   **Change mode, HiCache, context, or model**: `POST /config` (auth). SGLang restarts; the instance stays.
   **Change scripts**: `POST /upgrade?ref=v5.x` records a release tag. `vastai reboot instance <id>` fetches that tag
-  (`/cache` and the model stay). Tag `v5.2` on the default-branch merge commit of this release. Do not tag the PR
+  (`/cache` and the model stay). If that ref does not get SGLang healthy, boot rolls back to `/cache/penny-ref-good`
+  (see Recovery). Tag `v5.2` on the default-branch merge commit of this release. Do not tag the PR
   branch, and do not move `v5.1` or any older tag. The next release is a new tag on its own merge commit.
 - `NIXL=off`. HiCache = min(PENNY_HICACHE_GB=48, PENNY_RAM_GB-100); refuses to start below 108 GB rented RAM, and
   refuses to start when PENNY_RAM_GB is missing.
 - Tailscale (optional, userspace, no TUN): every step checked; "ok" only after `tailscale status --json` reports
   BackendState=Running and both `serve`s succeeded. Then SGLang and ctl bind **127.0.0.1** only, and the tailnet gets
   tcp/8000 → 127.0.0.1:8001 and tcp/8002 → 127.0.0.1:8002. `PENNY_PUBLIC_BIND=1` keeps the old 0.0.0.0 bind.
-  No `TS_AUTHKEY`: bind 0.0.0.0 and print `WARN ports 8001/8002 are public plain HTTP`. Tailscale failure also stays
-  on 0.0.0.0 (reachable from the internet only if the instance was created with `-p`).
+  No `TS_AUTHKEY`: bind 0.0.0.0 and print `WARN ports 8001/8002 are public plain HTTP`. If `tailscale up` or `serve`
+  does not succeed within the timeout, boot stays on 0.0.0.0 and prints one `WARN tailscale` line (see Recovery).
+  `TAILNET=1` publishes no `-p`, so that fallback is not reachable from outside the container.
   `TS_TAGS` defaults to empty. `tailscale up` gets `--advertise-tags` only when `TS_TAGS` is non-empty, because the
   auth key is not tagged.
   PENNY_RAM_GB must be the offer's RAM (gVisor cgroup showed 538 GB on a 189 GB rental).
@@ -53,13 +58,20 @@ Model must be in `models.allow` (strict regex, model dir confined to the models 
 the old server keeps serving until the new model is ready). HiCache above 48 or above `PENNY_RAM_GB-100` is rejected.
 `/upgrade` accepts only a release-tag shape. When ctl can see the remote without `GH_TOKEN` it also requires the tag
 to exist; otherwise the next reboot's bootstrap checks `refs/tags/<ref>` and fetches it (ctl never sees `GH_TOKEN`).
-No arbitrary exec: subprocess only with fixed arg lists, never shell=True.
+`verified=true` means that `git ls-remote` showed the exact `refs/tags/<ref>`. `verified=false` means the tag text
+was saved and ctl did not get that proof: the remote did not answer (private repo, network, or timeout) or
+`PENNY_REPO_URL` is not https. It is not a rejection. A tag ls-remote can see and that is missing is HTTP 400, and
+`/cache/penny-ref` stays unchanged. On the next reboot, bootstrap (it has `GH_TOKEN`) checks the tag and fetches it.
+A failed fetch keeps the cached scripts and the model.
+No arbitrary exec: subprocess only with fixed arg lists, never shell=True. `/cache/mode` and `/cache/active` are
+replaced with `rename`, same as `config.json`.
 
 ## Env
 First boot, required: PENNY_API_KEY, PENNY_REPO_URL, PENNY_REPO_REF (tag), PENNY_BOOTSTRAP_B64, PENNY_RAM_GB.
 First boot, optional: GH_TOKEN, PENNY_MODE (plain), PENNY_HICACHE_GB (48), PENNY_MODEL (whitelisted spec),
 TS_AUTHKEY, TS_TAGS (empty), PENNY_PUBLIC_BIND (unset), HF_TOKEN, PENNY_BOOT_B64/PENNY_CTL_B64.
-Kept in `/cache` after that (edit with the API, not a new instance): mode, HiCache, context length, model, script tag.
+Kept in `/cache` after that (edit with the API, not a new instance): mode, HiCache, context length, model, script tag,
+and `/cache/penny-ref-good` (last ref that brought SGLang up).
 Create command: `vast/create-instance.sh.example`.
 
 ## Risks (read before renting)
@@ -78,7 +90,27 @@ Create command: `vast/create-instance.sh.example`.
 - GH_TOKEN (read-only PAT) also sits in the Vast env; scope it to this repo, Contents read-only, short expiry.
 - ctl.py has no rate limiting; a leaked key allows downloads of the whitelisted models (disk-checked) and restarts.
 
+## Recovery
+
+Container stdout is what `vastai logs <instance_id>` prints. The same lines are in `/cache/logs/boot.log` and
+`/cache/logs/bootstrap.log`.
+
+**Tailscale did not come up.** `up` or `serve` missed its timeout. Boot binds **0.0.0.0** and prints one line,
+`WARN tailscale up/serve failed within the timeout`. Read it with `vastai logs <instance_id>`. **`TAILNET=1` does not
+pass `-p`**, and Vast cannot add that publish later, so the 0.0.0.0 bind is reachable only inside the container.
+Nothing on the public internet or the tailnet can open 8001 or 8002 until Tailscale is up. Fix the auth key or the
+tailnet, then `vastai reboot instance <id>`. The reboot retries Tailscale. The disk and the model stay. A new
+instance with `TAILNET=0` is what publishes `-p 8001:8001 -p 8002:8002`; that is a different machine and downloads
+the model again.
+
+**A script tag did not start.** `/cache/penny-ref-good` is the last ref whose SGLang answered `/health`, and
+`/cache/penny-vast-good` is that script tree. If a fetched ref exits or `/health` does not come up within
+`PENNY_HEALTH_TIMEOUT` (default 1800s), bootstrap kills that process, writes the good ref back to `/cache/penny-ref`,
+restores the good scripts, and starts them. The log line says `rolled back to <ref>` and `no recycle`. The model
+files are not in the script snapshot, so they are not downloaded again. `vastai logs <instance_id>` shows the WARN.
+To retry a fixed tag: `POST /upgrade?ref=v5.x`, then `vastai reboot instance <id>`.
+
 ## Tests (no GPU / no real model)
 `bash test/run_sim.sh <fakeroot> <tokenizer.json>` - fakeroot = upstream `configs/pennyroyal/` of pennyroyal-v3.0.2 in a git
 repo; the real patched upstream start files run end to end with stub `sglang`/`python`/`hf` and a fake HF API.
-`bash test/ts_test.sh boot.sh` - Tailscale block with stub tailscale/tailscaled (ok binds 127.0.0.1 and serves 8000+8002 / up fail / not Running / serve fail / download fail / PENNY_PUBLIC_BIND=1 stays on 0.0.0.0).
+`bash test/ts_test.sh boot.sh` - Tailscale block with stub tailscale/tailscaled (ok binds 127.0.0.1 and serves 8000+8002 / up fail / not Running / serve fail / download fail / PENNY_PUBLIC_BIND=1 stays on 0.0.0.0). A failed up/serve keeps 0.0.0.0 and the WARN names `vastai logs` and `vastai reboot instance`. Both test scripts `unset TS_AUTHKEY TS_TAGS GH_TOKEN` before they set their own fakes.

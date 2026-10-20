@@ -6,6 +6,7 @@
 # ok also binds 127.0.0.1 and serves tcp/8002. public_bind (PENNY_PUBLIC_BIND=1) keeps 0.0.0.0.
 # TS_TAGS defaults to empty: tailscale up must not receive --advertise-tags. A non-empty TS_TAGS passes it.
 set -uo pipefail
+unset TS_AUTHKEY TS_TAGS GH_TOKEN
 BOOT=$(readlink -f "${1:?boot.sh}"); T=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 PASS=0; FAIL=0
 for mode in ok up_fail not_running serve_fail dl_fail public_bind; do
@@ -31,6 +32,9 @@ for mode in ok up_fail not_running serve_fail dl_fail public_bind; do
   else
     if ! grep -q "bind 127.0.0.1" "$W/out.log"; then echo "PASS ts $mode: not tailnet-bound"; PASS=$((PASS+1))
     else echo "FAIL ts $mode: bound 127.0.0.1 after failure"; FAIL=$((FAIL+1)); fi
+    if grep -q 'vastai logs' "$W/out.log" && grep -q 'TAILNET=1' "$W/out.log" && grep -q 'vastai reboot instance' "$W/out.log" && grep -q 'binding 0.0.0.0' "$W/out.log"; then
+      echo "PASS ts $mode: fallback WARN tells you vastai logs and reboot"; PASS=$((PASS+1))
+    else echo "FAIL ts $mode: fallback WARN"; FAIL=$((FAIL+1)); fi
   fi
   grep -q "tskey-fake" "$W/out.log" "$W/ts.log" && { echo "FAIL ts $mode: authkey leaked"; FAIL=$((FAIL+1)); } || { echo "PASS ts $mode: authkey not in logs/argv"; PASS=$((PASS+1)); }
   [[ ! -e $C/ts/authkey ]] && { echo "PASS ts $mode: authkey file removed"; PASS=$((PASS+1)); } || { echo "FAIL ts $mode: authkey file left"; FAIL=$((FAIL+1)); }

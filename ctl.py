@@ -70,10 +70,22 @@ def hicache_ok(n):
 def context_ok(n):
     if isinstance(n, bool) or n not in CONTEXTS: return "context must be 65536|131072|262144|524288"
     return None
+def atomic_write(path, text):
+    """Write path via temp file + rename so a crash cannot leave a half-written mode or active file."""
+    if not text.endswith("\n"): text += "\n"
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(text)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
 def save_cfg():
     body = {"mode": st["mode"], "model": st["active"], "hicache_gb": st["hicache_gb"], "context_length": st["context"]}
     tmp = CFG_PATH + ".tmp"
-    with open(tmp, "w") as f: json.dump(body, f)
+    with open(tmp, "w") as f:
+        json.dump(body, f)
+        f.flush()
+        os.fsync(f.fileno())
     os.replace(tmp, CFG_PATH)
 def apply_runtime():
     os.environ["PENNY_HICACHE_GB"] = str(st["hicache_gb"])
@@ -197,7 +209,7 @@ def job(spec, mode):
             print(f"PENNY: download attempt {i+1} failed ({err}); retry in {RETRY_DELAY*(i+1):g}s", flush=True); time.sleep(RETRY_DELAY * (i + 1))
         if err: st.update(err=err, phase="error" if st["proc"] is None else st["phase"]); print("PENNY: ERROR " + err, flush=True); return
         with lock:
-            stop(); st.update(active=spec, mode=mode, err=None); open(C + "/active", "w").write(spec); open(C + "/mode", "w").write(mode); save_cfg(); launch()
+            stop(); st.update(active=spec, mode=mode, err=None); atomic_write(C + "/active", spec); atomic_write(C + "/mode", mode); save_cfg(); launch()
     finally: st["job"] = None
 def start_job(spec, mode):
     with lock:
@@ -247,7 +259,7 @@ class H(http.server.BaseHTTPRequestHandler):
             if m not in ("frspec", "plain"): return self.out(400, {"err": "m"})
             if m == "frspec" and not tok_ok(st["active"]): return self.out(409, {"err": "tokenizer fails FR-Spec check"})
             with lock:
-                stop(); st["mode"] = m; open(C+"/mode", "w").write(m); save_cfg(); apply_runtime()
+                stop(); st["mode"] = m; atomic_write(C + "/mode", m); save_cfg(); apply_runtime()
                 if complete(st["active"]): launch()
             self.out(200, {"mode": m, "pid": st["proc"] and st["proc"].pid})
         elif u.path == "/switch":
@@ -278,7 +290,7 @@ class H(http.server.BaseHTTPRequestHandler):
                 if st["job"]: return self.out(409, {"err": "busy", "job": st["job"]})
                 st.update(hicache_gb=h_new, context=c_new)
                 same = model is None or model == st["active"]
-                if same and m: st["mode"] = mode; open(C+"/mode", "w").write(mode)
+                if same and m: st["mode"] = mode; atomic_write(C + "/mode", mode)
                 apply_runtime(); save_cfg()
                 if same and complete(st["active"]): stop(); launch()
             if same: return self.out(200, {"mode": st["mode"], "hicache_gb": h_new, "context_length": c_new, "model": st["active"], "pid": st["proc"] and st["proc"].pid})

@@ -5,6 +5,8 @@
 # Env: PENNY_REPO_URL (https), PENNY_REPO_REF (required on first boot: a release tag such as v5.2; a 40-hex sha or
 #      branch also works). GH_TOKEN (optional, read-only PAT for a private repo; never logged, unset before boot.sh).
 # /cache/penny-ref, when it holds a release tag, overrides PENNY_REPO_REF (POST /upgrade, then vastai reboot).
+# /cache/penny-ref-good is the last ref whose SGLang passed /health. A fetched ref that dies or never becomes
+# healthy is rolled back to that ref and /cache/penny-vast-good. The model directory is not touched.
 # Fallback order: fresh fetch -> cached copy from an earlier boot in /cache -> PENNY_BOOT_B64 + PENNY_CTL_B64 -> exit 1.
 set -uo pipefail
 C=${PENNY_CACHE:-/cache}
@@ -16,6 +18,32 @@ D=$C/penny-vast
 NEW=$C/penny-vast.new
 mkdir -p "$C/logs"
 log() { echo "PENNY-BOOTSTRAP: $* ($(date -u +%FT%TZ))" | tee -a "$C/logs/bootstrap.log"; }
+atomic_line() {
+  local tmp
+  tmp=$(mktemp "$1.XXXXXX") || return 1
+  printf '%s\n' "$2" > "$tmp" || { rm -f "$tmp"; return 1; }
+  mv -f "$tmp" "$1"
+}
+kill_tree() {
+  local pid=$1 c
+  [[ -n ${pid:-} ]] || return 0
+  for c in $(ps -o pid= --ppid "$pid" 2>/dev/null); do kill_tree "$c"; done
+  kill -TERM "$pid" 2>/dev/null || true
+}
+sglang_healthy() { curl -fsS -m 2 "http://127.0.0.1:${PENNY_SGLANG_PORT:-8001}/health" >/dev/null 2>&1; }
+mark_good() { # $1 = directory that contains boot.sh
+  local ref dest=$C/penny-vast-good
+  ref=$(head -n 1 "$C/penny-ref" 2>/dev/null | tr -d '[:space:]')
+  [[ -n $ref ]] || ref=${PENNY_REPO_REF:-}
+  [[ -n $ref ]] || return 0
+  rm -rf "$dest.new"
+  mkdir -p "$dest.new"
+  cp -a "$1/." "$dest.new/"
+  rm -rf "$dest"
+  mv "$dest.new" "$dest"
+  atomic_line "$C/penny-ref-good" "$ref" || return 1
+  log "recorded good ref $ref"
+}
 if [[ -f $C/penny-ref ]]; then
   FILE_REF=$(head -n 1 "$C/penny-ref" | tr -d '[:space:]')
   if [[ $FILE_REF =~ ^v[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]; then
@@ -58,8 +86,14 @@ fetch() {
   echo "$head" > "$NEW/.penny-head"
 }
 
+FETCHED=0
 for i in 1 2 3; do
-  if fetch; then rm -rf "$D" && mv "$NEW" "$D" && printf '%s\n' "$REF" > "$C/penny-ref" && log "fetched $REPO_URL@$REF -> $(cat "$D/.penny-head")"; SRC=$D/$SUB; break; fi
+  if fetch && rm -rf "$D" && mv "$NEW" "$D" && atomic_line "$C/penny-ref" "$REF"; then
+    log "fetched $REPO_URL@$REF -> $(cat "$D/.penny-head")"
+    SRC=$D/$SUB
+    FETCHED=1
+    break
+  fi
   log "fetch attempt $i failed"; sleep $((i * 5))
 done
 if [[ -z ${SRC:-} && -f $D/$SUB/boot.sh && -f $D/$SUB/ctl.py ]]; then
@@ -72,4 +106,34 @@ if [[ -z ${SRC:-} && -n ${PENNY_BOOT_B64:-} && -n ${PENNY_CTL_B64:-} ]]; then
 fi
 [[ -n ${SRC:-} ]] || { log "FATAL: no scripts (fetch failed, no cache, no embedded copy)"; exit 1; }
 rm -rf "$NEW"
+good_ref=""
+[[ -f $C/penny-ref-good ]] && good_ref=$(head -n 1 "$C/penny-ref-good" | tr -d '[:space:]')
+# A new ref is supervised here, not inside the fetched boot.sh: that file may be the one that fails.
+if [[ $FETCHED == 1 && -n $good_ref && $good_ref != "$REF" && -f $C/penny-vast-good/boot.sh ]]; then
+  log "trying ref $REF (last good ref is $good_ref)"
+  env -u GH_TOKEN -u PENNY_BOOTSTRAP_B64 -u PENNY_BOOT_B64 -u PENNY_CTL_B64 PENNY_SUPERVISED=1 bash "$SRC/boot.sh" &
+  pid=$!
+  ok=0
+  tout=${PENNY_HEALTH_TIMEOUT:-1800}
+  for ((i = 0; i < tout; i++)); do
+    if ! kill -0 "$pid" 2>/dev/null; then break; fi
+    if sglang_healthy && kill -0 "$pid" 2>/dev/null; then ok=1; break; fi
+    sleep 1
+  done
+  if [[ $ok == 1 ]]; then
+    mark_good "$SRC"
+    wait "$pid"
+    exit $?
+  fi
+  log "WARN ref $REF failed SGLang start or health check; rolled back to $good_ref. Model and /cache stay; no recycle. Read vastai logs <id> and /cache/logs/bootstrap.log"
+  kill_tree "$pid"
+  sleep 1
+  kill -KILL "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  rm -rf "$D"
+  mkdir -p "$D"
+  cp -a "$C/penny-vast-good/." "$D/" || { log "FATAL: could not restore $good_ref"; exit 1; }
+  atomic_line "$C/penny-ref" "$good_ref" || { log "FATAL: could not restore penny-ref"; exit 1; }
+  exec env -u GH_TOKEN -u PENNY_BOOTSTRAP_B64 -u PENNY_BOOT_B64 -u PENNY_CTL_B64 PENNY_ROLLED_BACK=1 bash "$D/$SUB/boot.sh"
+fi
 exec env -u GH_TOKEN -u PENNY_BOOTSTRAP_B64 -u PENNY_BOOT_B64 -u PENNY_CTL_B64 bash "$SRC/boot.sh"

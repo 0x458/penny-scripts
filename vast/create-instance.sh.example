@@ -31,6 +31,8 @@ BOOT_B64=$(base64 -w0 bootstrap.sh)
 # target the tailnet. TAILNET=1 (default): no -p, set TS_AUTHKEY; boot binds 127.0.0.1 and tailscale serve exposes
 # tcp/8000 (SGLang) and tcp/8002 (ctl). TAILNET=0: -p 8001:8001 -p 8002:8002, no TS_AUTHKEY; public HTTP, boot WARNs.
 # Old public bind with Tailscale still up: TAILNET=0's -p flags, plus -e TS_AUTHKEY=<TS_AUTHKEY> -e PENNY_PUBLIC_BIND=1.
+# If tailscale up/serve times out, boot binds 0.0.0.0 and WARNs in `vastai logs <id>`. TAILNET=1 has no -p, so that
+# fallback is not reachable from outside. Fix Tailscale, then `vastai reboot instance <id>` (disk and model stay).
 TAILNET=${TAILNET:-1}
 if [[ $TAILNET == 1 ]]; then
   PORTS=""
