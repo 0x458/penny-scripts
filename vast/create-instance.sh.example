@@ -1,36 +1,56 @@
 #!/usr/bin/env bash
 # TEMPLATE ONLY - renting costs money; run only after the user approves. Replace every <...> placeholder.
 # Pitfalls baked in: Entrypoint mode (args start with exec; --raw BEFORE --args; --args LAST); no --ssh/--direct
-# (Fedora image has no apt-get -> Vast's sshd injection fails -> instance stopped); env/args are frozen at create
-# (update/reboot do not apply new env; only recycle does, and it wipes the disk) - scripts come from the repo instead.
+# (Fedora image has no apt-get -> Vast's sshd injection fails -> instance stopped).
+# Env/args are frozen at create. Later changes to mode, HiCache, context, model, and the script tag stay on this
+# instance: POST /config restarts SGLang, POST /upgrade then `vastai reboot` fetches the new tag. /cache is kept.
+# Do not vastai recycle for that — recycle wipes the disk and re-downloads the 135 GB model.
 set -euo pipefail
-GEO=${GEO:-JP}                      # search by region + GPU, then pick by id; `search offers "id=..."` is unreliable
+GEO=${GEO:-JP}                      # Japan. Search by region + GPU, then pick by id; `search offers "id=..."` is unreliable
 # Syntax per `vastai search offers --help` (CLI 1.8.2): gpu_ram / cpu_ram / disk_space are GB in the query (the CLI
 # multiplies gpu_ram/cpu_ram by 1000; the --raw JSON then reports them in MB). verified=any removes the default
 # verified=true filter (wildcard needs '='). --limit raises the number of returned offers.
-QUERY="num_gpus=1 gpu_ram>=90 gpu_arch=nvidia disk_space>=500 cpu_ram>=120 reliability>0.98 geolocation=$GEO rentable=true verified=any"
-vastai search offers "$QUERY" --limit 200 -o 'dph+' --raw > /tmp/offers.json
+# --type on-demand is non-interruptible (also the CLI default; set it explicitly). cpu_ram 180..200 includes ~189 GB.
+QUERY="num_gpus=1 gpu_ram>=90 gpu_arch=nvidia disk_space>=500 cpu_ram>=180 cpu_ram<=200 reliability>=0.99 geolocation=$GEO rentable=true verified=any"
+vastai search offers "$QUERY" --limit 200 --type on-demand -o 'dph+' --raw > /tmp/offers.json
 python3 - <<'PY'
 import json
 for o in json.load(open("/tmp/offers.json")):
     g = o.get("gpu_name", "")
-    if "PRO 6000" in g and "Max-Q" not in g:            # Max-Q = 300 W version, exclude by name
-        print(o["id"], o.get("machine_id"), g, f'{o["dph_total"]:.3f}$/h', f'ram={int(o["cpu_ram"]/1000)}GB',
-              f'disk={int(o["disk_space"])}GB', o.get("driver_version"), o.get("geolocation"), "verified" if o.get("verified") else "unverified")
+    ram = int(o["cpu_ram"] / 1000)
+    if "PRO 6000 S" in g and "Max-Q" not in g and 180 <= ram <= 200:
+        print(o["id"], o.get("machine_id"), g, f'{o["dph_total"]:.3f}$/h', f'ram={ram}GB',
+              f'disk={int(o["disk_space"])}GB', f'rel={o.get("reliability")}', o.get("driver_version"),
+              o.get("geolocation"), "verified" if o.get("verified") else "unverified")
 PY
 OFFER_ID=${OFFER_ID:?set OFFER_ID from the list above}
-RAM_GB=${RAM_GB:?set RAM_GB = that offer ram= value (caps HiCache; cgroup limit is NOT the rental)}
+RAM_GB=${RAM_GB:-189}
+[[ $RAM_GB == 189 ]] || echo "WARN: RAM_GB=$RAM_GB but the create command sets PENNY_RAM_GB=189 (the ~189 GB filter)" >&2
 BOOT_B64=$(base64 -w0 bootstrap.sh)
+# Vast -p publishes the public proxy onto the container eth0. Tailscale here is userspace (no TUN), so -p cannot
+# target the tailnet. TAILNET=1 (default): no -p, set TS_AUTHKEY; boot binds 127.0.0.1 and tailscale serve exposes
+# tcp/8000 (SGLang) and tcp/8002 (ctl). TAILNET=0: -p 8001:8001 -p 8002:8002, no TS_AUTHKEY; public HTTP, boot WARNs.
+# Old public bind with Tailscale still up: TAILNET=0's -p flags, plus -e TS_AUTHKEY=<TS_AUTHKEY> -e PENNY_PUBLIC_BIND=1.
+# If tailscale up/serve times out, boot binds 0.0.0.0 and WARNs in `vastai logs <id>`. TAILNET=1 has no -p, so that
+# fallback is not reachable from outside. Fix Tailscale, then `vastai reboot instance <id>` (disk and model stay).
+TAILNET=${TAILNET:-1}
+if [[ $TAILNET == 1 ]]; then
+  PORTS=""
+  EXTRA="-e TS_AUTHKEY=<TS_AUTHKEY>"
+else
+  PORTS="-p 8001:8001 -p 8002:8002"
+  EXTRA=""
+fi
 # shellcheck disable=SC2016  # $PENNY_BOOTSTRAP_B64 must expand inside the container, not here
 vastai create instance "$OFFER_ID" \
   --image ghcr.io/jpezzulli/sglang-rtxpro6000:v3.0.2 \
   --disk 500 \
-  --env "-p 8001:8001 -p 8002:8002 -e PENNY_API_KEY=<PENNY_API_KEY> -e PENNY_REPO_URL=https://github.com/0x458/<REPO>.git -e PENNY_REPO_REF=v5.1 -e GH_TOKEN=<GH_TOKEN_READONLY> -e PENNY_RAM_GB=$RAM_GB -e PENNY_MODE=plain -e PENNY_BOOTSTRAP_B64=$BOOT_B64" \
+  --env "$PORTS $EXTRA -e PENNY_API_KEY=<PENNY_API_KEY> -e PENNY_REPO_URL=https://github.com/0x458/<REPO>.git -e PENNY_REPO_REF=v5.2 -e GH_TOKEN=<GH_TOKEN_READONLY> -e PENNY_RAM_GB=189 -e PENNY_MODE=plain -e TS_TAGS= -e PENNY_BOOTSTRAP_B64=$BOOT_B64" \
   --raw \
   --args exec bash -c 'echo "$PENNY_BOOTSTRAP_B64" | base64 -d > /cache/bootstrap.sh && exec bash /cache/bootstrap.sh'
-# Optional extras inside --env: -e TS_AUTHKEY=<TS_AUTHKEY> -e TS_TAGS=tag:<tag>   (Tailscale; skipped when unset)
-#                               -e PENNY_BOOT_B64=$(base64 -w0 boot.sh) -e PENNY_CTL_B64=$(base64 -w0 ctl.py)  (offline fallback)
+# TS_TAGS is empty on purpose. boot.sh passes --advertise-tags only when TS_TAGS is non-empty; this auth key has no tag.
+# Optional extras inside --env: -e PENNY_BOOT_B64=$(base64 -w0 boot.sh) -e PENNY_CTL_B64=$(base64 -w0 ctl.py)  (offline fallback)
 # The --raw output contains instance_api_key: do not paste it anywhere.
-# PENNY_REPO_REF is a fixed release tag (v5.1). Upgrading = new tag (v5.2) + new instance with PENNY_REPO_REF=v5.2 (env is
-# frozen; recycle wipes the disk -> model re-download ~9 min). `vastai reboot instance <ID>` re-runs bootstrap on the SAME tag.
+# PENNY_REPO_REF=v5.2 is the first-boot tag. Tag v5.2 on the default-branch merge commit after this PR merges.
+# Do not move v5.1. Later script tags: POST /upgrade?ref=v5.x, then vastai reboot (disk and model stay).
 # If you ever need `vastai update instance`, it must include --image ghcr.io/jpezzulli/sglang-rtxpro6000:v3.0.2 (else HTTP 400).

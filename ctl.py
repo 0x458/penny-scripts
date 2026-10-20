@@ -1,6 +1,8 @@
 # Penny control server (v5, based on v4-orca): auth'd status/log/mode-switch + whitelisted model download/switch.
-# No arbitrary exec: subprocess only with fixed argument lists (never shell=True); the API key is masked in
-# everything this process prints or serves (SGLang prints server_args incl. api_key at startup).
+# POST /config writes /cache/config.json (mode, HiCache, context, whitelisted model) and restarts SGLang.
+# POST /upgrade records a release tag in /cache/penny-ref; the next vastai reboot fetches it. No arbitrary exec:
+# subprocess only with fixed argument lists (never shell=True); the API key is masked in everything this process
+# prints or serves (SGLang prints server_args incl. api_key at startup).
 import hashlib, hmac, http.server, json, os, re, shutil, signal, subprocess, sys, threading, time, urllib.parse, urllib.request
 KEY = os.environ["PENNY_API_KEY"]; KEYB = KEY.encode(); MASK = b"<API_KEY>"
 C = os.environ.get("PENNY_CACHE", "/cache"); LOG = C + "/logs"
@@ -15,6 +17,11 @@ MAX_RESTARTS = int(os.environ.get("PENNY_MAX_RESTARTS", "3"))            # autom
 RESTART_DELAY = float(os.environ.get("PENNY_RESTART_DELAY", "20"))
 RESERVE_GB = float(os.environ.get("PENNY_DISK_RESERVE_GB", "40"))  # JIT caches + logs
 ALLOW_FILE = os.environ.get("PENNY_ALLOW_FILE", os.path.join(os.path.dirname(os.path.abspath(__file__)), "models.allow"))
+CFG_PATH = C + "/config.json"; REF_PATH = C + "/penny-ref"
+CONTEXTS = {65536, 131072, 262144, 524288}
+HICACHE_MAX = 48
+TAG_RE = re.compile(r"v[0-9]+\.[0-9]+(?:\.[0-9]+)?")
+REPO_URL = os.environ.get("PENNY_REPO_URL", "")
 DEFAULT = "jpezzulli/OrcaRouter-Qwen3.8-Flash-Next-Uncensored-ModelOpt-NVFP4@f24d2b68ff2814f24455ae86717be276619b5664"
 FRSPEC_TOK_SHA = "0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3"   # what start-flash-next-frspec.sh demands
 SPEC_RE = re.compile(r"([A-Za-z0-9][A-Za-z0-9_-]{0,38})/([A-Za-z0-9][A-Za-z0-9_-]*(?:\.[A-Za-z0-9_-]+)*)@([0-9a-f]{40})")
@@ -46,12 +53,72 @@ def tok_ok(spec):
         with open(mdir(spec) + "/tokenizer.json", "rb") as f: return hashlib.sha256(f.read()).hexdigest() == FRSPEC_TOK_SHA
     except OSError: return False
 
-a0 = rd(C + "/active"); a0 = a0 if not valid(a0) else os.environ.get("PENNY_MODEL", DEFAULT)
-if valid(a0): print(f"PENNY: PENNY_MODEL {a0!r} rejected ({valid(a0)}), using default", flush=True); a0 = DEFAULT
-m0 = rd(C + "/mode") or os.environ.get("PENNY_MODE", "plain")      # Chinese is ~46% faster without FR-Spec
-st = {"mode": m0 if m0 in ("frspec", "plain") else "plain", "active": a0, "proc": None, "started": None, "phase": "boot",
-      "job": None, "err": None, "restarts": 0}
+def load_cfg():
+    try:
+        d = json.load(open(CFG_PATH))
+    except (OSError, ValueError): return {}
+    return d if isinstance(d, dict) else {}
+def ram_cap():
+    try: return int(os.environ.get("PENNY_RAM_GB") or "0") - 100
+    except ValueError: return -100
+def hicache_ok(n):
+    """None if n is an allowed HiCache size; else an error string."""
+    if isinstance(n, bool) or not isinstance(n, int): return "hicache_gb"
+    cap = min(HICACHE_MAX, ram_cap())
+    if n < 8 or n > cap: return f"hicache_gb must be 8..{cap}"
+    return None
+def context_ok(n):
+    if isinstance(n, bool) or n not in CONTEXTS: return "context must be 65536|131072|262144|524288"
+    return None
+def atomic_write(path, text):
+    """Write path via temp file + rename so a crash cannot leave a half-written mode or active file."""
+    if not text.endswith("\n"): text += "\n"
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(text)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+def save_cfg():
+    body = {"mode": st["mode"], "model": st["active"], "hicache_gb": st["hicache_gb"], "context_length": st["context"]}
+    tmp = CFG_PATH + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(body, f)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, CFG_PATH)
+def apply_runtime():
+    os.environ["PENNY_HICACHE_GB"] = str(st["hicache_gb"])
+    os.environ["PENNY_CONTEXT_LENGTH"] = str(st["context"])
+def pick_model(cfg):
+    cm = cfg.get("model")
+    if isinstance(cm, str) and valid(cm): print(f"PENNY: config model {cm!r} rejected ({valid(cm)}), using fallback", flush=True)
+    for cand in (cm, rd(C + "/active"), os.environ.get("PENNY_MODEL", ""), DEFAULT):
+        if isinstance(cand, str) and not valid(cand): return cand
+    return DEFAULT
+def pick_mode(cfg):
+    for cand in (cfg.get("mode"), rd(C + "/mode"), os.environ.get("PENNY_MODE", "")):  # default plain: Chinese is faster without FR-Spec
+        if cand in ("frspec", "plain"): return cand
+    return "plain"
+def pick_hicache(cfg):
+    h = cfg.get("hicache_gb")
+    if isinstance(h, int) and not isinstance(h, bool) and not hicache_ok(h): return h
+    try: h = int(os.environ["PENNY_HICACHE_GB"])
+    except (KeyError, ValueError): h = HICACHE_MAX
+    if hicache_ok(h):
+        cap = min(HICACHE_MAX, ram_cap())
+        h = cap if cap >= 8 else 8
+    return h
+def pick_context(cfg):
+    c = cfg.get("context_length")
+    if isinstance(c, int) and not isinstance(c, bool) and not context_ok(c): return c
+    return 524288
+
+cfg0 = load_cfg()
+st = {"mode": pick_mode(cfg0), "active": pick_model(cfg0), "hicache_gb": pick_hicache(cfg0), "context": pick_context(cfg0),
+      "proc": None, "started": None, "phase": "boot", "job": None, "err": None, "restarts": 0}
 lock = threading.Lock()
+apply_runtime(); save_cfg()
 
 def pump(p, path):
     with open(path, "ab") as f:
@@ -60,8 +127,10 @@ def pump(p, path):
 def launch(manual=True):
     """Caller holds lock. manual=True (boot/switch/mode) resets the crash-restart budget."""
     if manual: st["restarts"] = 0
+    apply_runtime()
     m, a = st["mode"], st["active"]
-    if m == "frspec" and not tok_ok(a): m = st["mode"] = "plain"; st["err"] = "tokenizer fails FR-Spec check; using plain"
+    if m == "frspec" and not tok_ok(a):
+        m = st["mode"] = "plain"; st["err"] = "tokenizer fails FR-Spec check; using plain"; save_cfg()
     path = f"{LOG}/server-{m}.log"
     env = {k: v for k, v in os.environ.items() if k not in ("GH_TOKEN", "TS_AUTHKEY", "HF_TOKEN")}
     env["PENNY_MODEL_DIR"] = mdir(a)
@@ -140,7 +209,7 @@ def job(spec, mode):
             print(f"PENNY: download attempt {i+1} failed ({err}); retry in {RETRY_DELAY*(i+1):g}s", flush=True); time.sleep(RETRY_DELAY * (i + 1))
         if err: st.update(err=err, phase="error" if st["proc"] is None else st["phase"]); print("PENNY: ERROR " + err, flush=True); return
         with lock:
-            stop(); st.update(active=spec, mode=mode, err=None); open(C + "/active", "w").write(spec); open(C + "/mode", "w").write(mode); launch()
+            stop(); st.update(active=spec, mode=mode, err=None); atomic_write(C + "/active", spec); atomic_write(C + "/mode", mode); save_cfg(); launch()
     finally: st["job"] = None
 def start_job(spec, mode):
     with lock:
@@ -162,6 +231,7 @@ class H(http.server.BaseHTTPRequestHandler):
         if u.path == "/status":
             p = st["proc"]; d = shutil.disk_usage(ROOT)
             self.out(200, {"phase": st["phase"], "mode": st["mode"], "active": st["active"], "job": st["job"], "err": st["err"],
+                "hicache_gb": st["hicache_gb"], "context_length": st["context"], "ref": rd(REF_PATH) or None,
                 "pid": p and p.pid, "rc": p and p.poll(), "restarts": st["restarts"], "up_s": st["started"] and round(time.time() - st["started"]),
                 "model_bytes": du(mdir(st["active"])), "disk_used_gb": round(d.used/1e9, 1), "disk_free_gb": round(d.free/1e9, 1),
                 "mem": open("/proc/meminfo").read().splitlines()[:3]})
@@ -189,7 +259,7 @@ class H(http.server.BaseHTTPRequestHandler):
             if m not in ("frspec", "plain"): return self.out(400, {"err": "m"})
             if m == "frspec" and not tok_ok(st["active"]): return self.out(409, {"err": "tokenizer fails FR-Spec check"})
             with lock:
-                stop(); st["mode"] = m; open(C+"/mode", "w").write(m)
+                stop(); st["mode"] = m; atomic_write(C + "/mode", m); save_cfg(); apply_runtime()
                 if complete(st["active"]): launch()
             self.out(200, {"mode": m, "pid": st["proc"] and st["proc"].pid})
         elif u.path == "/switch":
@@ -198,8 +268,58 @@ class H(http.server.BaseHTTPRequestHandler):
             if err: return self.out(400, {"err": err})
             if not start_job(spec, m): return self.out(409, {"err": "busy", "job": st["job"]})
             self.out(202, {"switching_to": spec, "mode": m, "downloaded": complete(spec)})
+        elif u.path == "/config":
+            m = q.get("m", [None])[0]; hs = q.get("hicache_gb", [None])[0]; cs = q.get("context", [None])[0]; model = q.get("model", [None])[0]
+            if m is None and hs is None and cs is None and model is None: return self.out(400, {"err": "set m, hicache_gb, context, or model"})
+            if m is not None and m not in ("frspec", "plain"): return self.out(400, {"err": "m"})
+            if m == "frspec" and model is None and not tok_ok(st["active"]): return self.out(409, {"err": "tokenizer fails FR-Spec check"})
+            h_new, c_new = st["hicache_gb"], st["context"]
+            if hs is not None:
+                if not re.fullmatch(r"[1-9][0-9]{0,2}", hs): return self.out(400, {"err": "hicache_gb"})
+                h_new = int(hs); err = hicache_ok(h_new)
+                if err: return self.out(400, {"err": err})
+            if cs is not None:
+                if not re.fullmatch(r"[1-9][0-9]{0,6}", cs): return self.out(400, {"err": "context"})
+                c_new = int(cs); err = context_ok(c_new)
+                if err: return self.out(400, {"err": err})
+            mode = m or st["mode"]
+            if model is not None:
+                err = valid(model)
+                if err: return self.out(400, {"err": err})
+            with lock:
+                if st["job"]: return self.out(409, {"err": "busy", "job": st["job"]})
+                st.update(hicache_gb=h_new, context=c_new)
+                same = model is None or model == st["active"]
+                if same and m: st["mode"] = mode; atomic_write(C + "/mode", mode)
+                apply_runtime(); save_cfg()
+                if same and complete(st["active"]): stop(); launch()
+            if same: return self.out(200, {"mode": st["mode"], "hicache_gb": h_new, "context_length": c_new, "model": st["active"], "pid": st["proc"] and st["proc"].pid})
+            if not start_job(model, mode): return self.out(409, {"err": "busy", "job": st["job"]})
+            self.out(202, {"switching_to": model, "mode": mode, "hicache_gb": h_new, "context_length": c_new, "downloaded": complete(model)})
+        elif u.path == "/upgrade":
+            ref = q.get("ref", [""])[0]
+            if not TAG_RE.fullmatch(ref): return self.out(400, {"err": "ref must be a release tag vN.N or vN.N.N"})
+            verified = False
+            if REPO_URL.startswith("https://"):
+                env = {k: v for k, v in os.environ.items() if k not in ("GH_TOKEN", "PENNY_API_KEY", "TS_AUTHKEY", "HF_TOKEN")}
+                env["GIT_TERMINAL_PROMPT"] = "0"
+                try:
+                    r = subprocess.run(["git", "ls-remote", "--tags", REPO_URL, "refs/tags/" + ref], capture_output=True, text=True, timeout=60, env=env)
+                except (OSError, subprocess.TimeoutExpired): r = None
+                if r is not None and r.returncode == 0:
+                    if not any(line.split("\t")[1:] == ["refs/tags/" + ref] for line in r.stdout.splitlines() if "\t" in line):
+                        return self.out(400, {"err": "tag not found"})
+                    verified = True
+            tmp = REF_PATH + ".tmp"
+            with open(tmp, "w") as f: f.write(ref + "\n")
+            os.replace(tmp, REF_PATH)
+            print(f"PENNY: upgrade ref {ref} verified={verified} (next reboot)", flush=True)
+            self.out(200, {"ref": ref, "verified": verified, "effect": "next reboot"})
         else: self.out(404, {})
 
 start_job(st["active"], st["mode"])
-print(f"PENNY: ctl listening {PORT} active={st['active']} mode={st['mode']}", flush=True)
-http.server.ThreadingHTTPServer(("0.0.0.0", PORT), H).serve_forever()
+BIND = os.environ.get("PENNY_BIND_HOST") or "0.0.0.0"
+if BIND not in ("127.0.0.1", "0.0.0.0"):
+    print("PENNY: WARN bad PENNY_BIND_HOST, using 0.0.0.0", flush=True); BIND = "0.0.0.0"
+print(f"PENNY: ctl listening {BIND}:{PORT} active={st['active']} mode={st['mode']} hicache={st['hicache_gb']} context={st['context']}", flush=True)
+http.server.ThreadingHTTPServer((BIND, PORT), H).serve_forever()
