@@ -87,8 +87,11 @@ echo "PENNY: start files ready (frspec, plain)"
 # PENNY_PUBLIC_BIND=1. Without TS_AUTHKEY, bind 0.0.0.0 and WARN. A failed Tailscale stays on 0.0.0.0.
 # An offline node that still holds TS_HOSTNAME makes `tailscale up` rename this one (vast-penny-1). Warn; do not exit.
 ts_note_hostname() {
-  local expect=${TS_HOSTNAME:-vast-penny} parsed got="" dns="" ip="" label="" show="" mismatch=0
-  parsed=$("$PY" -c 'import json,sys
+  local expect=${TS_HOSTNAME:-vast-penny} parsed got="" dns="" ip="" label="" show="" mismatch=0 py=$PY probe=""
+  # ts_test sets PENNY_PY=true so boot does not start ctl.py. A real interpreter is required to read status JSON.
+  probe=$("$py" -c 'print("pyok")' 2>/dev/null || true)
+  if [[ $probe != pyok ]]; then py=python3; fi
+  parsed=$("$py" -c 'import json,sys
 raw=sys.argv[1] if len(sys.argv)>1 else ""
 try: d=json.loads(raw) if raw.strip() else {}
 except Exception: d={}
