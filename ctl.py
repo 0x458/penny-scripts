@@ -19,7 +19,7 @@ RESERVE_GB = float(os.environ.get("PENNY_DISK_RESERVE_GB", "40"))  # JIT caches 
 ALLOW_FILE = os.environ.get("PENNY_ALLOW_FILE", os.path.join(os.path.dirname(os.path.abspath(__file__)), "models.allow"))
 CFG_PATH = C + "/config.json"; REF_PATH = C + "/penny-ref"
 CONTEXTS = {65536, 131072, 262144, 524288}
-HICACHE_MAX = 48
+HICACHE_DEFAULT = 48  # ceiling, and the size used, when PENNY_RAM_GB is unset
 TAG_RE = re.compile(r"v[0-9]+\.[0-9]+(?:\.[0-9]+)?")
 REPO_URL = os.environ.get("PENNY_REPO_URL", "")
 DEFAULT = "jpezzulli/OrcaRouter-Qwen3.8-Flash-Next-Uncensored-ModelOpt-NVFP4@f24d2b68ff2814f24455ae86717be276619b5664"
@@ -58,13 +58,18 @@ def load_cfg():
         d = json.load(open(CFG_PATH))
     except (OSError, ValueError): return {}
     return d if isinstance(d, dict) else {}
-def ram_cap():
-    try: return int(os.environ.get("PENNY_RAM_GB") or "0") - 100
-    except ValueError: return -100
+def hicache_max():
+    # Leave 100 GB for the system and the model (RAM PLE ~51 GB + process/pinned buffers ~40 GB).
+    # max = PENNY_RAM_GB - 100 when PENNY_RAM_GB is a positive integer; otherwise 48.
+    raw = os.environ.get("PENNY_RAM_GB")
+    if not raw: return HICACHE_DEFAULT
+    try: ram = int(raw)
+    except ValueError: return HICACHE_DEFAULT
+    return ram - 100 if ram > 0 else HICACHE_DEFAULT
 def hicache_ok(n):
     """None if n is an allowed HiCache size; else an error string."""
     if isinstance(n, bool) or not isinstance(n, int): return "hicache_gb"
-    cap = min(HICACHE_MAX, ram_cap())
+    cap = hicache_max()
     if n < 8 or n > cap: return f"hicache_gb must be 8..{cap}"
     return None
 def context_ok(n):
@@ -104,9 +109,9 @@ def pick_hicache(cfg):
     h = cfg.get("hicache_gb")
     if isinstance(h, int) and not isinstance(h, bool) and not hicache_ok(h): return h
     try: h = int(os.environ["PENNY_HICACHE_GB"])
-    except (KeyError, ValueError): h = HICACHE_MAX
+    except (KeyError, ValueError): h = HICACHE_DEFAULT
     if hicache_ok(h):
-        cap = min(HICACHE_MAX, ram_cap())
+        cap = hicache_max()
         h = cap if cap >= 8 else 8
     return h
 def pick_context(cfg):

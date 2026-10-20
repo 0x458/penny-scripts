@@ -26,7 +26,8 @@ exec > >(tee -a "$C/logs/boot.log") 2>&1
 echo "PENNY: boot v5 $(date -u) scripts=$(cat "$D/.penny-head" 2>/dev/null || echo embedded)"
 
 # HiCache: Vast/gVisor cgroup limits can be far above what was rented (538 GB seen vs 189 GB rented), so cap by
-# PENNY_RAM_GB. Budget: RAM PLE ~51 GB + process/pinned buffers ~40 GB => HiCache <= RAM - 100, max 48.
+# PENNY_RAM_GB. Budget: RAM PLE ~51 GB + process/pinned buffers ~40 GB => HiCache <= RAM - 100.
+# Default wanted size is 48. /cache/config.json may ask for more; it is still capped by RAM - 100.
 # /cache/config.json (POST /config) overrides the first-boot env and survives reboot.
 CFG_H=""; CFG_C=""
 if [[ -f $C/config.json ]]; then
@@ -84,8 +85,33 @@ echo "PENNY: start files ready (frspec, plain)"
 # Every step returns explicitly: set -e does NOT apply inside a function/subshell used in an if/|| context.
 # Vast -p cannot target the tailnet (no TUN). When Tailscale is up, bind 127.0.0.1 and serve both ports unless
 # PENNY_PUBLIC_BIND=1. Without TS_AUTHKEY, bind 0.0.0.0 and WARN. A failed Tailscale stays on 0.0.0.0.
+# An offline node that still holds TS_HOSTNAME makes `tailscale up` rename this one (vast-penny-1). Warn; do not exit.
+ts_note_hostname() {
+  local expect=${TS_HOSTNAME:-vast-penny} parsed got="" dns="" ip="" label="" show="" mismatch=0
+  parsed=$("$PY" -c 'import json,sys
+raw=sys.argv[1] if len(sys.argv)>1 else ""
+try: d=json.loads(raw) if raw.strip() else {}
+except Exception: d={}
+s=d.get("Self") if isinstance(d,dict) else None
+if not isinstance(s,dict): s={}
+host=s.get("HostName") if isinstance(s.get("HostName"),str) else ""
+dns=s.get("DNSName") if isinstance(s.get("DNSName"),str) else ""
+ips=s.get("TailscaleIPs") if isinstance(s.get("TailscaleIPs"),list) else []
+ip=",".join(x for x in ips if isinstance(x,str) and x)
+print(host); print(dns); print(ip)' "$1" 2>/dev/null) || parsed=""
+  { IFS= read -r got || true; IFS= read -r dns || true; IFS= read -r ip || true; } <<< "$parsed"
+  label=${dns%.}; label=${label%%.*}
+  [[ -n $got ]] || got=$label
+  if [[ -n $got && ${got,,} != "${expect,,}" ]]; then mismatch=1; fi
+  if [[ -n $label && ${label,,} != "${expect,,}" ]]; then mismatch=1; fi
+  if [[ $mismatch == 0 ]]; then return 0; fi
+  show=$got
+  if [[ -n $label && ${label,,} != "${expect,,}" ]]; then show=$label; fi
+  echo "PENNY: WARN tailscale hostname: asked for ${expect}, got ${show} (DNS ${dns:-unknown}, tailnet IP ${ip:-unknown}). An offline node still holds ${expect}. Delete that node in the Tailscale admin console, or connect clients to this tailnet IP. Boot continues."
+  return 0
+}
 ts_up() {
-  local TS=$1 V i state="" polls=${PENNY_TS_POLL:-30} tout=${PENNY_TS_TIMEOUT:-150}
+  local TS=$1 V i state="" stjson="" polls=${PENNY_TS_POLL:-30} tout=${PENNY_TS_TIMEOUT:-150}
   if [[ ! -x $TS/tailscaled || ! -x $TS/tailscale ]]; then
     V=$(curl -fsSL --retry 3 'https://pkgs.tailscale.com/stable/?mode=json' | "$PY" -c 'import json,sys;print(json.load(sys.stdin)["TarballsVersion"])') || { echo "PENNY: tailscale version lookup failed"; return 1; }
     [[ $V =~ ^[0-9][0-9.]*$ ]] || { echo "PENNY: bad tailscale version '$V'"; return 1; }
@@ -111,10 +137,12 @@ sys.exit(0 if n==2 else 1)' "$TS/ts.tgz" "$TS" || { echo "PENNY: tailscale unpac
   i=$?; rm -f "$TS/authkey"
   (( i == 0 )) || { echo "PENNY: tailscale up failed rc=$i"; return 1; }
   for ((i = 0; i < polls; i++)); do
-    state=$("$TS/tailscale" --socket="$TS/sock" status --json 2>/dev/null | grep -oE '"BackendState":[[:space:]]*"[A-Za-z]+"' | grep -oE '[A-Za-z]+"$' | tr -d '"')
+    stjson=$("$TS/tailscale" --socket="$TS/sock" status --json 2>/dev/null || true)
+    state=$(printf '%s' "$stjson" | grep -oE '"BackendState":[[:space:]]*"[A-Za-z]+"' | grep -oE '[A-Za-z]+"$' | tr -d '"' || true)
     [[ $state == Running ]] && break; sleep 2
   done
   [[ $state == Running ]] || { echo "PENNY: tailscale BackendState=${state:-unknown}, not Running"; return 1; }
+  ts_note_hostname "$stjson"
   timeout "$tout" "$TS/tailscale" --socket="$TS/sock" serve --bg --tcp 8000 tcp://127.0.0.1:8001 || { echo "PENNY: tailscale serve failed"; return 1; }
   timeout "$tout" "$TS/tailscale" --socket="$TS/sock" serve --bg --tcp 8002 tcp://127.0.0.1:8002 || { echo "PENNY: tailscale serve failed"; return 1; }
   echo "PENNY: tailscale up + serve tcp 8000 ok (BackendState=Running)"
