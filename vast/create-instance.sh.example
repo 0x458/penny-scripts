@@ -43,11 +43,11 @@ fi
 vastai create instance "$OFFER_ID" \
   --image ghcr.io/jpezzulli/sglang-rtxpro6000:v3.0.2 \
   --disk 500 \
-  --env "$PORTS $EXTRA -e PENNY_API_KEY=<PENNY_API_KEY> -e PENNY_REPO_URL=https://github.com/0x458/<REPO>.git -e PENNY_REPO_REF=v5.2 -e GH_TOKEN=<GH_TOKEN_READONLY> -e PENNY_RAM_GB=189 -e PENNY_MODE=plain -e PENNY_BOOTSTRAP_B64=$BOOT_B64" \
+  --env "$PORTS $EXTRA -e PENNY_API_KEY=<PENNY_API_KEY> -e PENNY_REPO_URL=https://github.com/0x458/<REPO>.git -e PENNY_REPO_REF=v5.2 -e GH_TOKEN=<GH_TOKEN_READONLY> -e PENNY_RAM_GB=189 -e PENNY_MODE=plain -e TS_TAGS= -e PENNY_BOOTSTRAP_B64=$BOOT_B64" \
   --raw \
   --args exec bash -c 'echo "$PENNY_BOOTSTRAP_B64" | base64 -d > /cache/bootstrap.sh && exec bash /cache/bootstrap.sh'
-# Optional extras inside --env: -e TS_TAGS=tag:<tag>
-#                               -e PENNY_BOOT_B64=$(base64 -w0 boot.sh) -e PENNY_CTL_B64=$(base64 -w0 ctl.py)  (offline fallback)
+# TS_TAGS is empty on purpose. boot.sh passes --advertise-tags only when TS_TAGS is non-empty; this auth key has no tag.
+# Optional extras inside --env: -e PENNY_BOOT_B64=$(base64 -w0 boot.sh) -e PENNY_CTL_B64=$(base64 -w0 ctl.py)  (offline fallback)
 # The --raw output contains instance_api_key: do not paste it anywhere.
 # PENNY_REPO_REF=v5.2 is the first-boot tag. Tag v5.2 on the default-branch merge commit after this PR merges.
 # Do not move v5.1. Later script tags: POST /upgrade?ref=v5.x, then vastai reboot (disk and model stay).

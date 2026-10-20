@@ -3,7 +3,8 @@
 # Prepares both start files (plain = default, frspec) from the pinned upstream copies, optional Tailscale,
 # then runs ctl.py (:8002), which downloads the pinned model, writes .complete and starts SGLang (:8001).
 # Env (first boot): PENNY_API_KEY, PENNY_RAM_GB (rented RAM, caps HiCache). Optional: PENNY_HICACHE_GB, PENNY_MODE,
-#      PENNY_MODEL, TS_AUTHKEY, TS_TAGS, PENNY_PUBLIC_BIND=1 (keep 0.0.0.0 even when Tailscale is up).
+#      PENNY_MODEL, TS_AUTHKEY, TS_TAGS (default empty; --advertise-tags only when set),
+#      PENNY_PUBLIC_BIND=1 (keep 0.0.0.0 even when Tailscale is up).
 # After first boot, /cache/config.json and /cache/penny-ref win over the frozen Vast env.
 set -euo pipefail
 C=${PENNY_CACHE:-/cache}
@@ -100,7 +101,11 @@ sys.exit(0 if n==2 else 1)' "$TS/ts.tgz" "$TS" || { echo "PENNY: tailscale unpac
   for ((i = 0; i < polls; i++)); do [[ -S $TS/sock ]] && break; sleep 1; done
   [[ -S $TS/sock ]] || { echo "PENNY: tailscaled socket did not appear in ${polls}s"; return 1; }
   ( umask 077; printf '%s' "$TS_AUTHKEY" > "$TS/authkey" ) || return 1
-  "$TS/tailscale" --socket="$TS/sock" up --timeout=120s --hostname="${TS_HOSTNAME:-vast-penny}" --auth-key="file:$TS/authkey" ${TS_TAGS:+--advertise-tags="$TS_TAGS"}
+  # Empty by default. The auth key is not tagged, and `tailscale up --advertise-tags` fails on that key.
+  local -a up_cmd
+  up_cmd=(--socket="$TS/sock" up --timeout=120s --hostname="${TS_HOSTNAME:-vast-penny}" --auth-key="file:$TS/authkey")
+  if [[ -n ${TS_TAGS:-} ]]; then up_cmd+=(--advertise-tags="$TS_TAGS"); fi
+  "$TS/tailscale" "${up_cmd[@]}"
   i=$?; rm -f "$TS/authkey"
   (( i == 0 )) || { echo "PENNY: tailscale up failed rc=$i"; return 1; }
   for ((i = 0; i < polls; i++)); do

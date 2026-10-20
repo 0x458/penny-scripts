@@ -212,6 +212,8 @@ else echo "SKIP vastai CLI not installed"; fi
 grep -q "PENNY_REPO_REF=v5.2" "$V5/vast/create-instance.sh.example" && grep -q "v5.2" "$V5/README.md" && ! grep -q "PENNY_REPO_REF=main" "$V5/vast/create-instance.sh.example" "$V5/README.md" && ok "template + README pin tag v5.2" || bad "tag alignment"
 grep -q "PENNY_RAM_GB=189" "$V5/vast/create-instance.sh.example" && ok "template PENNY_RAM_GB=189" || bad "PENNY_RAM_GB"
 grep -q "reliability>=0.99" "$V5/vast/create-instance.sh.example" && grep -q "cpu_ram>=180 cpu_ram<=200" "$V5/vast/create-instance.sh.example" && grep -q "PRO 6000 S" "$V5/vast/create-instance.sh.example" && grep -q -- "--type on-demand" "$V5/vast/create-instance.sh.example" && grep -q 'GEO=${GEO:-JP}' "$V5/vast/create-instance.sh.example" && ok "template selects JP, PRO 6000 S, on-demand, ~189 GB, reliability >= 0.99" || bad "offer filter"
+ENVLINE=$(sed -n '/--env /p' "$V5/vast/create-instance.sh.example")
+printf '%s\n' "$ENVLINE" | grep -q -- '-e TS_TAGS= ' && ! printf '%s\n' "$ENVLINE" | grep -E -q 'TS_TAGS=[^[:space:]"$]' && ! printf '%s\n' "$ENVLINE" | grep -q -- '--advertise-tags' && ok "template TS_TAGS left empty" || bad "TS_TAGS template"
 
 echo "=== 9. tailscale block"
 TSOUT=$(bash "$T/ts_test.sh" "$V5/boot.sh"); echo "$TSOUT" | grep -E "^\[|RESULT"

@@ -35,6 +35,8 @@ Model pinned: `jpezzulli/OrcaRouter-Qwen3.8-Flash-Next-Uncensored-ModelOpt-NVFP4
   tcp/8000 → 127.0.0.1:8001 and tcp/8002 → 127.0.0.1:8002. `PENNY_PUBLIC_BIND=1` keeps the old 0.0.0.0 bind.
   No `TS_AUTHKEY`: bind 0.0.0.0 and print `WARN ports 8001/8002 are public plain HTTP`. Tailscale failure also stays
   on 0.0.0.0 (reachable from the internet only if the instance was created with `-p`).
+  `TS_TAGS` defaults to empty. `tailscale up` gets `--advertise-tags` only when `TS_TAGS` is non-empty, because the
+  auth key is not tagged.
   PENNY_RAM_GB must be the offer's RAM (gVisor cgroup showed 538 GB on a 189 GB rental).
 - Default `plain` (Chinese ~46% faster without FR-Spec); `POST /mode?m=frspec` for English/code. FR-Spec is refused if
   the model's tokenizer.json sha256 is not 0997f410... (all three whitelisted models pass).
@@ -56,7 +58,7 @@ No arbitrary exec: subprocess only with fixed arg lists, never shell=True.
 ## Env
 First boot, required: PENNY_API_KEY, PENNY_REPO_URL, PENNY_REPO_REF (tag), PENNY_BOOTSTRAP_B64, PENNY_RAM_GB.
 First boot, optional: GH_TOKEN, PENNY_MODE (plain), PENNY_HICACHE_GB (48), PENNY_MODEL (whitelisted spec),
-TS_AUTHKEY + TS_TAGS, PENNY_PUBLIC_BIND (unset), HF_TOKEN, PENNY_BOOT_B64/PENNY_CTL_B64.
+TS_AUTHKEY, TS_TAGS (empty), PENNY_PUBLIC_BIND (unset), HF_TOKEN, PENNY_BOOT_B64/PENNY_CTL_B64.
 Kept in `/cache` after that (edit with the API, not a new instance): mode, HiCache, context length, model, script tag.
 Create command: `vast/create-instance.sh.example`.
 
