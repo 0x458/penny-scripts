@@ -31,6 +31,10 @@ cp -r "$V5/boot.sh" "$V5/ctl.py" "$V5/bootstrap.sh" "$V5/models.allow" "$V5/upst
 git -C "$SRC" init -q -b main && git -C "$SRC" add -A && git -C "$SRC" -c user.email=t@t -c user.name=t commit -qm v5 && git -C "$SRC" push -q "$BARE" main
 SHA=$(git -C "$SRC" rev-parse HEAD)
 git -C "$SRC" -c user.email=t@t -c user.name=t tag -a v5.1 -m v5.1 && git -C "$SRC" push -q "$BARE" v5.1
+echo v5.2 > "$SRC/REF-MARKER"
+git -C "$SRC" add REF-MARKER && git -C "$SRC" -c user.email=t@t -c user.name=t commit -qm v5.2
+git -C "$SRC" -c user.email=t@t -c user.name=t tag -a v5.2 -m v5.2 && git -C "$SRC" push -q "$BARE" v5.2
+SHA2=$(git -C "$SRC" rev-parse 'v5.2^{}')
 URL=https://github.com/0x458/penny-scripts.git
 printf '[url "%s"]\n\tinsteadOf = %s\n' "$BARE" "$URL" > "$C/.gitconfig"   # bootstrap sets HOME=$C; maps the https URL to the local bare repo
 
@@ -68,8 +72,11 @@ echo "--- launch argv (plain):"; tail -1 "$W/argv.jsonl" | sed "s|$W|\$W|g; s|$K
 [[ $(lastarg --speculative-token-map) == ABSENT ]] && ok "plain: no FR-Spec map" || bad "plain has map"
 [[ $(lastarg --hicache-storage-backend) == ABSENT ]] && ok "NIXL off: no storage backend args" || bad nixl
 [[ $(lastarg --port) == 8001 && $(lastarg --host) == 0.0.0.0 ]] && ok "--host 0.0.0.0 --port 8001" || bad port
+[[ $(lastarg --context-length) == 524288 ]] && ok "--context-length 524288" || bad "context $(lastarg --context-length)"
 chk "NIXL off message in server log" grep -q "NIXL disk tier: off" "$C/logs/server-plain.log"
 chk "tailscale skipped without TS_AUTHKEY" grep -q "TS_AUTHKEY unset, skipping tailscale" "$W/container.log"
+chk "WARN public HTTP without Tailscale" grep -q "WARN ports 8001/8002 are public plain HTTP" "$W/container.log"
+chk "ctl bound 0.0.0.0" grep -q "ctl listening 0.0.0.0:18002" "$W/container.log"
 
 echo "=== 2. api key masking"
 chk "fake SGLang really printed server_args (masked)" grep -q "api_key='<API_KEY>'" "$W/container.log"
@@ -80,7 +87,7 @@ CPID=$(pgrep -f "python3 .*penny-vast/ctl.py" | head -1)
 tr '\0' '\n' < "/proc/$CPID/environ" | grep -q '^GH_TOKEN=' && bad "GH_TOKEN in ctl env" || ok "GH_TOKEN unset in ctl.py env (pid $CPID)"
 
 echo "=== 3. auth + malicious input"
-for c in "-X GET $CTL/status" "-X POST $CTL/mode?m=frspec" "-X POST $CTL/switch?model=$DEAL"; do
+for c in "-X GET $CTL/status" "-X POST $CTL/mode?m=frspec" "-X POST $CTL/switch?model=$DEAL" "-X POST $CTL/config?hicache_gb=32" "-X POST $CTL/upgrade?ref=v5.2"; do
   # shellcheck disable=SC2086
   code=$(curl -s -o /dev/null -w '%{http_code}' $c); [[ $code == 401 ]] && ok "no token -> 401 ($c)" || bad "no token $code ($c)"; done
 code=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer wrong" "$CTL/status"); [[ $code == 401 ]] && ok "wrong token -> 401" || bad "wrong token $code"
@@ -130,12 +137,36 @@ r=$(curl -s -w ' %{http_code}' -X POST "${A[@]}" "$CTL/mode?m=frspec"); [[ $r ==
 curl -s -X POST "${A[@]}" "$CTL/switch?model=$ORCA&m=plain" >/dev/null
 for _ in $(seq 30); do st | grep -q "\"active\": \"$ORCA\"" && break; sleep 1; done; waitphase serving:plain
 echo "--- /models:"; curl -s "${A[@]}" "$CTL/models" | python3 -c "import json,sys;d=json.load(sys.stdin);print('active',d['active'][:40]);[print(' ',m) for m in d['models']]"
+
+echo "=== 5b. /config and /upgrade (no new instance)"
+N=$(nargv)
+r=$(curl -s -w ' %{http_code}' -X POST "${A[@]}" "$CTL/config?hicache_gb=32&context=262144"); echo "$r"
+[[ $r == *" 200" ]] && ok "/config hicache+context -> 200" || bad "/config $r"
+chk "sglang restarted with new hicache/context" waitargv "$N"
+[[ $(lastarg --hicache-size) == 32 ]] && ok "--hicache-size 32 from /config" || bad "hicache $(lastarg --hicache-size)"
+[[ $(lastarg --context-length) == 262144 ]] && ok "--context-length 262144 from /config" || bad "context $(lastarg --context-length)"
+st | grep -q '"hicache_gb": 32' && st | grep -q '"context_length": 262144' && ok "/status shows hicache 32 context 262144" || bad "status $(st)"
+python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d["hicache_gb"]==32 and d["context_length"]==262144 and d["mode"]=="plain"' "$C/config.json" && ok "config.json saved" || bad "config.json"
+grep -qF -- "$KEY" "$C/config.json" && bad "API key in config.json" || ok "API key absent from config.json"
+r=$(curl -s -w ' %{http_code}' -X POST "${A[@]}" "$CTL/config?hicache_gb=3"); [[ $r == *" 400" ]] && ok "reject hicache_gb=3" || bad "hicache 3 $r"
+r=$(curl -s -w ' %{http_code}' -X POST "${A[@]}" "$CTL/config?hicache_gb=49"); [[ $r == *" 400" ]] && ok "reject hicache_gb=49" || bad "hicache 49 $r"
+r=$(curl -s -w ' %{http_code}' -X POST "${A[@]}" "$CTL/config?context=100000"); [[ $r == *" 400" ]] && ok "reject context=100000" || bad "context $r"
+r=$(curl -s -w ' %{http_code}' -X POST "${A[@]}" "$CTL/config?m=bash"); [[ $r == *" 400" ]] && ok "reject /config mode=bash" || bad "config mode $r"
+r=$(curl -s -w ' %{http_code}' -X POST "${A[@]}" "$CTL/config?model=evil/Nope@f24d2b68ff2814f24455ae86717be276619b5664"); [[ $r == *" 400" ]] && ok "reject /config model outside whitelist" || bad "config model $r"
+r=$(curl -s -o "$W/up.json" -w '%{http_code}' -X POST "${A[@]}" "$CTL/upgrade?ref=main"); [[ $r == 400 ]] && ok "reject /upgrade ref=main" || bad "upgrade main $r"
+r=$(curl -s -o "$W/up.json" -w '%{http_code}' -X POST "${A[@]}" "$CTL/upgrade?ref=v9.9"); [[ $r == 400 ]] && ok "reject /upgrade missing tag v9.9" || bad "upgrade v9.9 $r $(cat "$W/up.json")"
+grep -qx v5.1 "$C/penny-ref" && ok "rejected upgrade did not replace penny-ref" || bad "penny-ref $(cat "$C/penny-ref" 2>/dev/null)"
+r=$(curl -s -o "$W/up.json" -w '%{http_code}' -X POST "${A[@]}" "$CTL/upgrade?ref=v5.2"); echo "upgrade v5.2 HTTP $r $(cat "$W/up.json")"
+[[ $r == 200 ]] && grep -q '"verified": true' "$W/up.json" && grep -qx v5.2 "$C/penny-ref" && ok "/upgrade v5.2 recorded for next reboot" || bad "upgrade v5.2 $r $(cat "$W/up.json") penny-ref=$(cat "$C/penny-ref" 2>/dev/null)"
+grep -qF -- "$KEY" "$W/up.json" "$C/penny-ref" && bad "API key in upgrade output" || ok "API key absent from upgrade output"
+grep -qF -- "$GHT" "$W/up.json" "$C/penny-ref" "$C/config.json" && bad "GH_TOKEN in config/upgrade" || ok "GH_TOKEN absent from config and upgrade"
 kill "$BOOT" 2>/dev/null; pkill -f "penny-vast/ctl.py" ; pkill -f "$R/.venv/bin/sglang"; sleep 1
 
 echo "=== 6. HiCache cap by rented RAM"
 C2=$W/c2; mkdir -p "$C2"; cp -r "$C/penny-vast" "$C2/"
 PENNY_CACHE=$C2 PENNY_RAM_GB=128 PENNY_CTL_PORT=18003 timeout 5 bash "$C2/penny-vast/boot.sh" > "$W/c2.log" 2>&1
-chk "RAM 128 -> HICACHE_SIZE_GB=28" grep -q '^HICACHE_SIZE_GB=28$' "$C2/start-plain.sh"
+grep -q "HiCache 28 GB" "$W/c2.log" && ok "RAM 128 -> HiCache 28 GB" || bad "ram 128 $(grep HiCache "$W/c2.log")"
+grep -q 'HICACHE_SIZE_GB="${PENNY_HICACHE_GB:' "$C2/start-plain.sh" && ok "hicache comes from the environment" || bad "hicache patch"
 grep "HiCache" "$W/c2.log"
 env -u PENNY_RAM_GB PENNY_CACHE="$C2" timeout 5 bash "$C2/penny-vast/boot.sh" > "$W/c4.log" 2>&1; rc=$?
 [[ $rc != 0 ]] && grep -q "FATAL PENNY_RAM_GB is required" "$W/c4.log" && ok "PENNY_RAM_GB unset -> refuses to start (rc=$rc)" || bad "ram unset rc=$rc"
@@ -161,6 +192,9 @@ PENNY_BOOT_B64=$(base64 -w0 "$V5/boot.sh") PENNY_CTL_B64=$(base64 -w0 "$V5/ctl.p
 grep -q "using embedded" "$W/b7c.log" && ok "embedded PENNY_BOOT_B64/PENNY_CTL_B64 fallback used" || bad 7c
 # 7d http URL refused
 PENNY_REPO_URL=http://example.com/x.git bash "$C/bootstrap.sh" > "$W/b7d.log" 2>&1 && bad "http accepted" || ok "non-https repo URL refused"
+printf '[url "%s"]\n\tinsteadOf = %s\n' "$BARE" "$URL" > "$C/.gitconfig"
+env -u PENNY_API_KEY bash "$C/bootstrap.sh" > "$W/b7e.log" 2>&1 || true
+grep -q "recorded ref v5.2 overrides env PENNY_REPO_REF=v5.1" "$C/logs/bootstrap.log" && grep -q "fetched $URL@v5.2 -> $SHA2" "$W/b7e.log" && ok "reboot fetches recorded tag v5.2 ($SHA2), not the frozen env" || bad "ref override: $(grep -E 'recorded ref|fetched' "$W/b7e.log" | tail -5)"
 kill $APIPID 2>/dev/null
 echo "=== 8. vast search query (offline parse with the installed vastai CLI parser; no API call)"
 VPY=/home/box/.local/share/pipx/venvs/vastai/bin/python
@@ -174,8 +208,10 @@ print(json.dumps(parse_query(sys.argv[1], {"verified":{"eq":True},"external":{"e
   echo "$PQ" | grep -q '"gpu_ram": {"gte": 90000.0}' && ok "gpu_ram>=90 parsed (x1000 -> MB)" || bad gpu_ram
   echo "$PQ" | grep -q '"verified"' && bad "verified filter still present" || ok "verified=any removes the default verified=true"
   grep -q -- "--limit 200" "$V5/vast/create-instance.sh.example" && grep -q '"Max-Q" not in g' "$V5/vast/create-instance.sh.example" && ok "template: --limit 200 + python Max-Q exclusion" || bad template
-  grep -q "PENNY_REPO_REF=v5.1" "$V5/vast/create-instance.sh.example" && grep -q "PENNY_REPO_REF=v5.1\|v5.1" "$V5/README.md" && ! grep -q "PENNY_REPO_REF=main" "$V5/vast/create-instance.sh.example" "$V5/README.md" && ok "template + README pin tag v5.1" || bad "tag alignment"
 else echo "SKIP vastai CLI not installed"; fi
+grep -q "PENNY_REPO_REF=v5.2" "$V5/vast/create-instance.sh.example" && grep -q "v5.2" "$V5/README.md" && ! grep -q "PENNY_REPO_REF=main" "$V5/vast/create-instance.sh.example" "$V5/README.md" && ok "template + README pin tag v5.2" || bad "tag alignment"
+grep -q "PENNY_RAM_GB=189" "$V5/vast/create-instance.sh.example" && ok "template PENNY_RAM_GB=189" || bad "PENNY_RAM_GB"
+grep -q "reliability>=0.99" "$V5/vast/create-instance.sh.example" && grep -q "cpu_ram>=180 cpu_ram<=200" "$V5/vast/create-instance.sh.example" && grep -q "PRO 6000 S" "$V5/vast/create-instance.sh.example" && grep -q -- "--type on-demand" "$V5/vast/create-instance.sh.example" && grep -q 'GEO=${GEO:-JP}' "$V5/vast/create-instance.sh.example" && ok "template selects JP, PRO 6000 S, on-demand, ~189 GB, reliability >= 0.99" || bad "offer filter"
 
 echo "=== 9. tailscale block"
 TSOUT=$(bash "$T/ts_test.sh" "$V5/boot.sh"); echo "$TSOUT" | grep -E "^\[|RESULT"

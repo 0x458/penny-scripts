@@ -2,8 +2,9 @@
 # Penny v5 boot (Penny Royal v3.0.2 + jpezzulli Orca NVFP4 @f24d2b68 on one RTX PRO 6000).
 # Prepares both start files (plain = default, frspec) from the pinned upstream copies, optional Tailscale,
 # then runs ctl.py (:8002), which downloads the pinned model, writes .complete and starts SGLang (:8001).
-# Env: PENNY_API_KEY (required), PENNY_RAM_GB (required: rented RAM from the offer, caps HiCache), optional
-#      PENNY_HICACHE_GB, PENNY_MODE (plain|frspec), PENNY_MODEL (must be in models.allow), TS_AUTHKEY, TS_TAGS.
+# Env (first boot): PENNY_API_KEY, PENNY_RAM_GB (rented RAM, caps HiCache). Optional: PENNY_HICACHE_GB, PENNY_MODE,
+#      PENNY_MODEL, TS_AUTHKEY, TS_TAGS, PENNY_PUBLIC_BIND=1 (keep 0.0.0.0 even when Tailscale is up).
+# After first boot, /cache/config.json and /cache/penny-ref win over the frozen Vast env.
 set -euo pipefail
 C=${PENNY_CACHE:-/cache}
 export HOME=$C PENNY_CACHE=$C
@@ -23,13 +24,32 @@ echo "PENNY: boot v5 $(date -u) scripts=$(cat "$D/.penny-head" 2>/dev/null || ec
 
 # HiCache: Vast/gVisor cgroup limits can be far above what was rented (538 GB seen vs 189 GB rented), so cap by
 # PENNY_RAM_GB. Budget: RAM PLE ~51 GB + process/pinned buffers ~40 GB => HiCache <= RAM - 100, max 48.
-WANT=${PENNY_HICACHE_GB:-48}
+# /cache/config.json (POST /config) overrides the first-boot env and survives reboot.
+CFG_H=""; CFG_C=""
+if [[ -f $C/config.json ]]; then
+  read -r CFG_H CFG_C < <("$PY" -c 'import json,sys
+try:
+    d=json.load(open(sys.argv[1]))
+except Exception:
+    raise SystemExit
+if not isinstance(d, dict):
+    raise SystemExit
+h, c = d.get("hicache_gb"), d.get("context_length")
+print(h if isinstance(h, int) and not isinstance(h, bool) else "", c if isinstance(c, int) and not isinstance(c, bool) else "")
+' "$C/config.json") || true
+fi
+if [[ $CFG_H =~ ^[1-9][0-9]{0,3}$ ]]; then WANT=$CFG_H; else WANT=${PENNY_HICACHE_GB:-48}; fi
 RAM=${PENNY_RAM_GB:-}
 [[ -n $RAM ]] || { echo "PENNY: FATAL PENNY_RAM_GB is required (the offer's RAM in GB; the cgroup/MemTotal value is not the rental)" >&2; exit 1; }
 [[ $WANT =~ ^[1-9][0-9]{0,3}$ && $RAM =~ ^[1-9][0-9]{0,4}$ ]] || { echo "PENNY: FATAL bad PENNY_HICACHE_GB/PENNY_RAM_GB" >&2; exit 1; }
 HICACHE_GB=$(( RAM - 100 < WANT ? RAM - 100 : WANT ))
 (( HICACHE_GB >= 8 )) || { echo "PENNY: FATAL rented RAM ${RAM} GB too small (need >=108 GB for PLE + HiCache)" >&2; exit 1; }
-echo "PENNY: HiCache ${HICACHE_GB} GB (rented RAM ${RAM} GB, wanted ${WANT}); disk free $(df -BG --output=avail "$PENNY_MODELS_ROOT" | tail -1 | tr -d ' ')"
+export PENNY_HICACHE_GB=$HICACHE_GB
+CONTEXT=524288
+if [[ $CFG_C =~ ^(65536|131072|262144|524288)$ ]]; then CONTEXT=$CFG_C
+elif [[ -n $CFG_C ]]; then echo "PENNY: WARN bad context_length in config, using 524288"; fi
+export PENNY_CONTEXT_LENGTH=$CONTEXT
+echo "PENNY: HiCache ${HICACHE_GB} GB (rented RAM ${RAM} GB, wanted ${WANT}); context ${CONTEXT}; disk free $(df -BG --output=avail "$PENNY_MODELS_ROOT" | tail -1 | tr -d ' ')"
 
 for mode in frspec plain; do
   src=start-flash-next.sh; [[ $mode == frspec ]] && src=start-flash-next-frspec.sh
@@ -44,11 +64,13 @@ for mode in frspec plain; do
   # shellcheck disable=SC2016  # $PENNY_* must stay literal in the generated start file
   sed -e 's|^TARGET_MODEL=.*|TARGET_MODEL="${PENNY_MODEL_DIR:?PENNY_MODEL_DIR not set}"|' \
       -e 's|^NIXL=on$|NIXL=off|' \
-      -e "s|^HICACHE_SIZE_GB=.*|HICACHE_SIZE_GB=$HICACHE_GB|" \
+      -e 's|^HICACHE_SIZE_GB=.*|HICACHE_SIZE_GB="${PENNY_HICACHE_GB:?PENNY_HICACHE_GB not set}"|' \
+      -e 's|^CONTEXT_LENGTH=.*|CONTEXT_LENGTH="${PENNY_CONTEXT_LENGTH:-524288}"|' \
+      -e 's|--host 0\.0\.0\.0 --port 8001|--host "${PENNY_BIND_HOST:-0.0.0.0}" --port 8001|' \
       -e 's|--served-model-name pennyroyal \\|--served-model-name flash-next --api-key "$PENNY_API_KEY" \\|' "$f" > "$out"
   # Every patch must land exactly once.
   # shellcheck disable=SC2016
-  for pat in '^TARGET_MODEL="\$\{PENNY_MODEL_DIR:\?' '^NIXL=off$' "^HICACHE_SIZE_GB=$HICACHE_GB\$" 'served-model-name flash-next --api-key "\$PENNY_API_KEY"'; do
+  for pat in '^TARGET_MODEL="\$\{PENNY_MODEL_DIR:\?' '^NIXL=off$' '^HICACHE_SIZE_GB="\$\{PENNY_HICACHE_GB:\?PENNY_HICACHE_GB not set\}"$' '^CONTEXT_LENGTH="\$\{PENNY_CONTEXT_LENGTH:-524288\}"$' 'served-model-name flash-next --api-key "\$PENNY_API_KEY"' '--host "\$\{PENNY_BIND_HOST:-0\.0\.0\.0\}" --port 8001'; do
     [[ $(grep -cE -- "$pat" "$out") == 1 ]] || { echo "PENNY: FATAL patch check failed in $out: $pat" >&2; exit 1; }
   done
   bash -n "$out"
@@ -57,7 +79,8 @@ echo "PENNY: start files ready (frspec, plain)"
 
 # Optional Tailscale (userspace; image has no root/TUN). Only with TS_AUTHKEY; key passed via a 0600 file, not argv.
 # Every step returns explicitly: set -e does NOT apply inside a function/subshell used in an if/|| context.
-# Failure is only a WARN - Penny keeps running on the public ports.
+# Vast -p cannot target the tailnet (no TUN). When Tailscale is up, bind 127.0.0.1 and serve both ports unless
+# PENNY_PUBLIC_BIND=1. Without TS_AUTHKEY, bind 0.0.0.0 and WARN. A failed Tailscale stays on 0.0.0.0.
 ts_up() {
   local TS=$1 V i state="" polls=${PENNY_TS_POLL:-30}
   if [[ ! -x $TS/tailscaled || ! -x $TS/tailscale ]]; then
@@ -86,14 +109,26 @@ sys.exit(0 if n==2 else 1)' "$TS/ts.tgz" "$TS" || { echo "PENNY: tailscale unpac
   done
   [[ $state == Running ]] || { echo "PENNY: tailscale BackendState=${state:-unknown}, not Running"; return 1; }
   "$TS/tailscale" --socket="$TS/sock" serve --bg --tcp 8000 tcp://127.0.0.1:8001 || { echo "PENNY: tailscale serve failed"; return 1; }
+  "$TS/tailscale" --socket="$TS/sock" serve --bg --tcp 8002 tcp://127.0.0.1:8002 || { echo "PENNY: tailscale serve failed"; return 1; }
   echo "PENNY: tailscale up + serve tcp 8000 ok (BackendState=Running)"
 }
+export PENNY_BIND_HOST=0.0.0.0
 if [[ -n ${TS_AUTHKEY:-} ]]; then
   mkdir -p "$C/ts/state"
-  ts_up "$C/ts" || echo "PENNY: WARN tailscale failed (public ports 8001/8002 still work)"
+  if ts_up "$C/ts"; then
+    if [[ ${PENNY_PUBLIC_BIND:-} == 1 ]]; then
+      echo "PENNY: PENNY_PUBLIC_BIND=1, ports 8001/8002 stay on 0.0.0.0"
+    else
+      export PENNY_BIND_HOST=127.0.0.1
+      echo "PENNY: bind 127.0.0.1 only (tailnet tcp/8000 -> :8001, tcp/8002 -> :8002)"
+    fi
+  else
+    echo "PENNY: WARN tailscale failed (binding 0.0.0.0; public only if -p 8001/8002 is published)"
+  fi
   rm -f "$C/ts/authkey"
 else
   echo "PENNY: TS_AUTHKEY unset, skipping tailscale"
+  echo "PENNY: WARN ports 8001/8002 are public plain HTTP"
 fi
 unset TS_AUTHKEY
 exec "$PY" "$D/ctl.py"
