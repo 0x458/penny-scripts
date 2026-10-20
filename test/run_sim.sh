@@ -154,7 +154,14 @@ st | grep -q '"hicache_gb": 32' && st | grep -q '"context_length": 262144' && ok
 python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d["hicache_gb"]==32 and d["context_length"]==262144 and d["mode"]=="plain"' "$C/config.json" && ok "config.json saved" || bad "config.json"
 grep -qF -- "$KEY" "$C/config.json" && bad "API key in config.json" || ok "API key absent from config.json"
 r=$(curl -s -w ' %{http_code}' -X POST "${A[@]}" "$CTL/config?hicache_gb=3"); [[ $r == *" 400" ]] && ok "reject hicache_gb=3" || bad "hicache 3 $r"
-r=$(curl -s -w ' %{http_code}' -X POST "${A[@]}" "$CTL/config?hicache_gb=49"); [[ $r == *" 400" ]] && ok "reject hicache_gb=49" || bad "hicache 49 $r"
+N=$(nargv)
+r=$(curl -s -w ' %{http_code}' -X POST "${A[@]}" "$CTL/config?hicache_gb=64"); echo "$r"
+[[ $r == *" 200" ]] && ok "RAM 189 GB accepts hicache_gb=64 (>48)" || bad "hicache 64 $r"
+chk "sglang restarted with hicache 64" waitargv "$N"
+[[ $(lastarg --hicache-size) == 64 ]] && ok "--hicache-size 64 above the old ceiling of 48" || bad "hicache $(lastarg --hicache-size)"
+r=$(curl -s -w ' %{http_code}' -X POST "${A[@]}" "$CTL/config?hicache_gb=90")
+[[ $r == *" 400" && $r == *"hicache_gb must be 8..89"* ]] && ok "RAM 189 GB rejects hicache_gb=90 (cap PENNY_RAM_GB-100)" || bad "hicache 90 $r"
+st | grep -q '"hicache_gb": 64' && ok "rejected hicache left the running value at 64" || bad "status after 90: $(st)"
 r=$(curl -s -w ' %{http_code}' -X POST "${A[@]}" "$CTL/config?context=100000"); [[ $r == *" 400" ]] && ok "reject context=100000" || bad "context $r"
 r=$(curl -s -w ' %{http_code}' -X POST "${A[@]}" "$CTL/config?m=bash"); [[ $r == *" 400" ]] && ok "reject /config mode=bash" || bad "config mode $r"
 r=$(curl -s -w ' %{http_code}' -X POST "${A[@]}" "$CTL/config?model=evil/Nope@f24d2b68ff2814f24455ae86717be276619b5664"); [[ $r == *" 400" ]] && ok "reject /config model outside whitelist" || bad "config model $r"
@@ -166,6 +173,24 @@ r=$(curl -s -o "$W/up.json" -w '%{http_code}' -X POST "${A[@]}" "$CTL/upgrade?re
 grep -qF -- "$KEY" "$W/up.json" "$C/penny-ref" && bad "API key in upgrade output" || ok "API key absent from upgrade output"
 grep -qF -- "$GHT" "$W/up.json" "$C/penny-ref" "$C/config.json" && bad "GH_TOKEN in config/upgrade" || ok "GH_TOKEN absent from config and upgrade"
 kill "$BOOT" 2>/dev/null; pkill -f "penny-vast/ctl.py" ; pkill -f "$R/.venv/bin/sglang"; sleep 1
+
+echo "=== 5c. HiCache ceiling stays 48 when PENNY_RAM_GB is unset"
+C3=$W/c3ctl; mkdir -p "$C3/logs"
+env -u PENNY_RAM_GB PENNY_CACHE=$C3 PENNY_MODELS_ROOT=$C/models PENNY_START_DIR=$C PENNY_CTL_PORT=18004 \
+  FAKE_ARGV_OUT=$W/argv-noram.jsonl \
+  python3 "$V5/ctl.py" > "$W/noram.log" 2>&1 &
+NRPID=$!
+nr=0
+for _ in $(seq 40); do curl -s -m 2 -H "Authorization: Bearer $KEY" http://127.0.0.1:18004/status 2>/dev/null | grep -q '"phase": "serving:plain"' && nr=1 && break; sleep 0.5; done
+[[ $nr == 1 ]] && ok "ctl up with PENNY_RAM_GB unset" || bad "noram ctl: $(tail -8 "$W/noram.log" | tr '\n' '|')"
+r=$(curl -s -w ' %{http_code}' -X POST -H "Authorization: Bearer $KEY" "http://127.0.0.1:18004/config?hicache_gb=49")
+[[ $r == *" 400" && $r == *"hicache_gb must be 8..48"* ]] && ok "unset PENNY_RAM_GB rejects hicache_gb=49 (cap 48)" || bad "noram 49 $r"
+r=$(curl -s -w ' %{http_code}' -X POST -H "Authorization: Bearer $KEY" "http://127.0.0.1:18004/config?hicache_gb=48")
+[[ $r == *" 200" ]] && ok "unset PENNY_RAM_GB accepts hicache_gb=48" || bad "noram 48 $r"
+kill "$NRPID" 2>/dev/null || true
+wait "$NRPID" 2>/dev/null || true
+pkill -f "$R/.venv/bin/sglang" 2>/dev/null || true
+sleep 1
 
 echo "=== 6. HiCache cap by rented RAM"
 C2=$W/c2; mkdir -p "$C2"; cp -r "$C/penny-vast" "$C2/"
@@ -321,6 +346,8 @@ printf '%s\n' "$ENVLINE" | grep -q -- '-e TS_TAGS= ' && ! printf '%s\n' "$ENVLIN
 grep -q 'def atomic_write' "$V5/ctl.py" && ! grep -E 'open\(C \+ "/active"|open\(C\+"/mode"|open\(C \+ "/mode"' "$V5/ctl.py" && ok "ctl.py writes mode and active with atomic_write" || bad "atomic_write"
 grep -q 'unset TS_AUTHKEY TS_TAGS GH_TOKEN' "$0" "$T/ts_test.sh" && ok "test scripts unset TS_AUTHKEY TS_TAGS GH_TOKEN" || bad "test unset"
 grep -q 'verified=false' "$V5/README.md" && grep -q 'penny-ref-good' "$V5/README.md" && grep -q 'vastai logs' "$V5/README.md" && grep -q 'vastai reboot instance' "$V5/README.md" && grep -q 'TAILNET=1' "$V5/README.md" && grep -q 'no recycle' "$V5/README.md" && ok "README documents verified=false and both recovery flows" || bad "README recovery"
+rec=$(awk 'BEGIN{p=0} /^## Recovery/{p=1} /^## Tests/{p=0} p' "$V5/README.md")
+printf '%s\n' "$rec" | grep -q 'sshd' && printf '%s\n' "$rec" | grep -q 'vastai logs' && printf '%s\n' "$rec" | grep -q 'vastai reboot' && printf '%s\n' "$rec" | grep -q 'Tailscale admin' && printf '%s\n' "$rec" | grep -q 'tailnet IP' && ok "Recovery: no sshd, hostname collision, vastai logs/reboot" || bad "README recovery sshd/hostname"
 
 echo "=== 9. tailscale block"
 TSOUT=$(bash "$T/ts_test.sh" "$V5/boot.sh"); echo "$TSOUT" | grep -E "^\[|RESULT"

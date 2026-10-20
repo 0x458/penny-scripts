@@ -33,6 +33,9 @@ BOOT_B64=$(base64 -w0 bootstrap.sh)
 # Old public bind with Tailscale still up: TAILNET=0's -p flags, plus -e TS_AUTHKEY=<TS_AUTHKEY> -e PENNY_PUBLIC_BIND=1.
 # If tailscale up/serve times out, boot binds 0.0.0.0 and WARNs in `vastai logs <id>`. TAILNET=1 has no -p, so that
 # fallback is not reachable from outside. Fix Tailscale, then `vastai reboot instance <id>` (disk and model stay).
+# Before a rebuild, delete the old offline node in the Tailscale admin console (default hostname vast-penny).
+# If it is still registered, the new node is renamed (vast-penny-1). Use the tailnet IP from the boot WARN, or
+# delete the old node and reboot. This image has no sshd; tailnet + ctl is how you manage it.
 TAILNET=${TAILNET:-1}
 if [[ $TAILNET == 1 ]]; then
   PORTS=""

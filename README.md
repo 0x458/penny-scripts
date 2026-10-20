@@ -35,8 +35,9 @@ Model pinned: `jpezzulli/OrcaRouter-Qwen3.8-Flash-Next-Uncensored-ModelOpt-NVFP4
   (`/cache` and the model stay). If that ref does not get SGLang healthy, boot rolls back to `/cache/penny-ref-good`
   (see Recovery). Tag `v5.2` on the default-branch merge commit of this release. Do not tag the PR
   branch, and do not move `v5.1` or any older tag. The next release is a new tag on its own merge commit.
-- `NIXL=off`. HiCache = min(PENNY_HICACHE_GB=48, PENNY_RAM_GB-100); refuses to start below 108 GB rented RAM, and
-  refuses to start when PENNY_RAM_GB is missing.
+- `NIXL=off`. Default HiCache is 48 GB, then `min(wanted, PENNY_RAM_GB-100)`. Boot refuses to start below 108 GB
+  rented RAM, and refuses to start when PENNY_RAM_GB is missing. `POST /config` uses that same ceiling, so a 189 GB
+  rental can set HiCache above 48. With `PENNY_RAM_GB` unset, ctl keeps the ceiling at 48.
 - Tailscale (optional, userspace, no TUN): every step checked; "ok" only after `tailscale status --json` reports
   BackendState=Running and both `serve`s succeeded. Then SGLang and ctl bind **127.0.0.1** only, and the tailnet gets
   tcp/8000 → 127.0.0.1:8001 and tcp/8002 → 127.0.0.1:8002. `PENNY_PUBLIC_BIND=1` keeps the old 0.0.0.0 bind.
@@ -44,7 +45,11 @@ Model pinned: `jpezzulli/OrcaRouter-Qwen3.8-Flash-Next-Uncensored-ModelOpt-NVFP4
   does not succeed within the timeout, boot stays on 0.0.0.0 and prints one `WARN tailscale` line (see Recovery).
   `TAILNET=1` publishes no `-p`, so that fallback is not reachable from outside the container.
   `TS_TAGS` defaults to empty. `tailscale up` gets `--advertise-tags` only when `TS_TAGS` is non-empty, because the
-  auth key is not tagged.
+  auth key is not tagged. `TS_HOSTNAME` defaults to `vast-penny`.
+  Before you create or rebuild, delete any offline node that still holds that hostname in the Tailscale admin
+  console. If it is still registered, Tailscale renames the new node (for example `vast-penny-1`) and clients that
+  hardcode the old name cannot connect. Boot does not exit: it prints `WARN tailscale hostname` with the actual name
+  and the tailnet IP. Use that IP, or delete the old node and reboot.
   PENNY_RAM_GB must be the offer's RAM (gVisor cgroup showed 538 GB on a 189 GB rental).
 - Default `plain` (Chinese ~46% faster without FR-Spec); `POST /mode?m=frspec` for English/code. FR-Spec is refused if
   the model's tokenizer.json sha256 is not 0997f410... (all three whitelisted models pass).
@@ -55,10 +60,11 @@ Model pinned: `jpezzulli/OrcaRouter-Qwen3.8-Flash-Next-Uncensored-ModelOpt-NVFP4
 ## ctl.py (Bearer PENNY_API_KEY on every endpoint)
 GET `/status`, `/models`, `/log?f=server|download|boot|bootstrap|server-frspec|server-plain&n=80`, `/smi`;
 POST `/mode?m=frspec|plain`, `/switch?model=<org/repo@40-hex>[&m=plain|frspec]`,
-`/config?m=plain|frspec&hicache_gb=8..48&context=65536|131072|262144|524288&model=<org/repo@40-hex>`,
+`/config?m=plain|frspec&hicache_gb=8..(PENNY_RAM_GB-100)&context=65536|131072|262144|524288&model=<org/repo@40-hex>`,
 `/upgrade?ref=vN.N` (optional patch, `vN.N.N`).
 Model must be in `models.allow` (strict regex, model dir confined to the models root, disk checked before download;
-the old server keeps serving until the new model is ready). HiCache above 48 or above `PENNY_RAM_GB-100` is rejected.
+the old server keeps serving until the new model is ready). HiCache above `PENNY_RAM_GB-100` is rejected
+(`hicache_gb must be 8..<cap>`). With `PENNY_RAM_GB` unset the ceiling stays 48.
 `/upgrade` accepts only a release-tag shape. When ctl can see the remote without `GH_TOKEN` it also requires the tag
 to exist; otherwise the next reboot's bootstrap checks `refs/tags/<ref>` and fetches it (ctl never sees `GH_TOKEN`).
 `verified=true` means that `git ls-remote` showed the exact `refs/tags/<ref>`. `verified=false` means the tag text
@@ -72,7 +78,7 @@ replaced with `rename`, same as `config.json`.
 ## Env
 First boot, required: PENNY_API_KEY, PENNY_REPO_URL, PENNY_REPO_REF (tag), PENNY_BOOTSTRAP_B64, PENNY_RAM_GB.
 First boot, optional: GH_TOKEN, PENNY_MODE (plain), PENNY_HICACHE_GB (48), PENNY_MODEL (whitelisted spec),
-TS_AUTHKEY, TS_TAGS (empty), PENNY_PUBLIC_BIND (unset), HF_TOKEN, PENNY_BOOT_B64/PENNY_CTL_B64.
+TS_AUTHKEY, TS_HOSTNAME (vast-penny), TS_TAGS (empty), PENNY_PUBLIC_BIND (unset), HF_TOKEN, PENNY_BOOT_B64/PENNY_CTL_B64.
 Kept in `/cache` after that (edit with the API, not a new instance): mode, HiCache, context length, model, script tag,
 and `/cache/penny-ref-good` (last ref that brought SGLang up).
 Create command: `vast/create-instance.sh.example`.
@@ -106,6 +112,17 @@ tailnet, then `vastai reboot instance <id>`. The reboot retries Tailscale. The d
 instance with `TAILNET=0` is what publishes `-p 8001:8001 -p 8002:8002`; that is a different machine and downloads
 the model again.
 
+**Tailscale renamed the node.** `tailscale up` asks for `TS_HOSTNAME` (default `vast-penny`). An offline node that
+still holds that name makes Tailscale assign another one, such as `vast-penny-1`. Clients that hardcode
+`vast-penny` then cannot connect. Boot does not exit. It prints `WARN tailscale hostname` with the name it actually
+got and the tailnet IP. Delete the old node in the Tailscale admin console before you rebuild, or point clients at
+that tailnet IP. After the old node is gone, a reboot lets this machine take the expected name.
+
+**No sshd in this image.** `ghcr.io/jpezzulli/sglang-rtxpro6000:v3.0.2` does not ship sshd (and has no apt-get, so
+Vast cannot inject one). You manage the machine over the tailnet and ctl (`tcp/8002`, Bearer `PENNY_API_KEY`):
+`/status`, `/log`, `/config`, `/upgrade`. When the tailnet is down, the only remaining controls are
+`vastai logs <instance_id>` and `vastai reboot instance <id>`.
+
 **A script tag did not start.** `/cache/penny-ref-good` is the last ref whose SGLang answered `/health`, and
 `/cache/penny-vast-good` is that script tree. If a fetched ref exits or `/health` does not come up within
 `PENNY_HEALTH_TIMEOUT` (default 1800s), bootstrap kills that process, writes the good ref back to `/cache/penny-ref`,
@@ -116,4 +133,4 @@ To retry a fixed tag: `POST /upgrade?ref=v5.x`, then `vastai reboot instance <id
 ## Tests (no GPU / no real model)
 `bash test/run_sim.sh <fakeroot> <tokenizer.json>` - fakeroot = upstream `configs/pennyroyal/` of pennyroyal-v3.0.2 in a git
 repo; the real patched upstream start files run end to end with stub `sglang`/`python`/`hf` and a fake HF API.
-`bash test/ts_test.sh boot.sh` - Tailscale block with stub tailscale/tailscaled (ok binds 127.0.0.1 and serves 8000+8002 / up fail / not Running / serve fail / download fail / PENNY_PUBLIC_BIND=1 stays on 0.0.0.0). A failed up/serve keeps 0.0.0.0 and the WARN names `vastai logs` and `vastai reboot instance`. Both test scripts `unset TS_AUTHKEY TS_TAGS GH_TOKEN` before they set their own fakes.
+`bash test/ts_test.sh boot.sh` - Tailscale block with stub tailscale/tailscaled (ok binds 127.0.0.1 and serves 8000+8002 / up fail / not Running / serve fail / download fail / PENNY_PUBLIC_BIND=1 stays on 0.0.0.0 / renamed hostname WARNs with the real name and tailnet IP and still comes up). A failed up/serve keeps 0.0.0.0 and the WARN names `vastai logs` and `vastai reboot instance`. Both test scripts `unset TS_AUTHKEY TS_TAGS GH_TOKEN` before they set their own fakes.
