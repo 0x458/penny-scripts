@@ -2,6 +2,8 @@
 # Penny v5 boot (Penny Royal v3.0.2 + jpezzulli Orca NVFP4 @f24d2b68 on one RTX PRO 6000).
 # Prepares both start files (plain = default, frspec) from the pinned upstream copies, optional Tailscale,
 # then runs ctl.py (:8002), which downloads the pinned model, writes .complete and starts SGLang (:8001).
+# Generated start files default PENNY_REASONING_EFFORT to xhigh, and inject the upstream YaRN
+# factor-2.0 override only when context is 524288 (the native window is 262144).
 # Env (first boot): PENNY_API_KEY, PENNY_RAM_GB (rented RAM, caps HiCache). Optional: PENNY_HICACHE_GB, PENNY_MODE,
 #      PENNY_MODEL, TS_AUTHKEY, TS_TAGS (default empty; --advertise-tags only when set),
 #      PENNY_PUBLIC_BIND=1 (keep 0.0.0.0 even when Tailscale is up).
@@ -55,6 +57,55 @@ elif [[ -n $CFG_C ]]; then echo "PENNY: WARN bad context_length in config, using
 export PENNY_CONTEXT_LENGTH=$CONTEXT
 echo "PENNY: HiCache ${HICACHE_GB} GB (rented RAM ${RAM} GB, wanted ${WANT}); context ${CONTEXT}; disk free $(df -BG --output=avail "$PENNY_MODELS_ROOT" | tail -1 | tr -d ' ')"
 
+# Upstream hardcodes two things we do not want at the usual 262144 context.
+# reasoning-effort.sh keeps medium when PENNY_REASONING_EFFORT is unset; default xhigh here.
+# YaRN factor 2.0 (original_max_position_embeddings 262144) exists only to stretch that
+# native window to 524288. At 65536, 131072, and 262144 it rescales RoPE for no extra
+# room and hurts short text, so the launch omits --json-model-override-args. 524288 keeps it.
+# An explicit PENNY_REASONING_EFFORT still wins. A request reasoning_effort still wins later
+# in OpenAIServingChat; the start file only sets the server default.
+rewrite_start_quality() {
+  local file=$1 line tmp
+  local old='--json-model-override-args "$TARGET_OVERRIDES"'
+  local new='"${JSON_MODEL_OVERRIDE_ARGS[@]}"'
+  tmp=$(mktemp)
+  while IFS= read -r line || [[ -n $line ]]; do
+    case $line in
+      'source "$IMAGE_CONFIGS/reasoning-effort.sh"')
+        cat >> "$tmp" <<'EOF'
+# reasoning-effort.sh uses medium when PENNY_REASONING_EFFORT is unset or empty.
+# Default xhigh. An explicit PENNY_REASONING_EFFORT still wins. A request
+# reasoning_effort still wins in OpenAIServingChat; this is only the server default.
+: "${PENNY_REASONING_EFFORT:=xhigh}"
+export PENNY_REASONING_EFFORT
+source "$IMAGE_CONFIGS/reasoning-effort.sh"
+EOF
+        ;;
+      TARGET_OVERRIDES=*)
+        cat >> "$tmp" <<'EOF'
+# Native context is 262144. YaRN factor 2.0 (original_max_position_embeddings
+# 262144) is the 2x extension to 524288 and nothing else. Any other allowed
+# context, including the usual 262144, injects no override.
+if [[ "$CONTEXT_LENGTH" == 524288 ]]; then
+  TARGET_OVERRIDES='{"text_config":{"rope_parameters":{"mrope_interleaved":true,"mrope_section":[11,11,10],"rope_type":"yarn","rope_theta":10000000,"partial_rotary_factor":0.25,"factor":2.0,"original_max_position_embeddings":262144}}}'
+  JSON_MODEL_OVERRIDE_ARGS=(--json-model-override-args "$TARGET_OVERRIDES")
+else
+  TARGET_OVERRIDES=''
+  JSON_MODEL_OVERRIDE_ARGS=()
+fi
+EOF
+        ;;
+      *)
+        # Only the launch line. The 524288 arm above keeps the literal flag
+        # that fills JSON_MODEL_OVERRIDE_ARGS; a global replace would empty it.
+        if [[ $line == *"$old"* ]]; then line=${line//"$old"/"$new"}; fi
+        printf '%s\n' "$line" >> "$tmp"
+        ;;
+    esac
+  done < "$file"
+  mv -f "$tmp" "$file"
+}
+
 for mode in frspec plain; do
   src=start-flash-next.sh; [[ $mode == frspec ]] && src=start-flash-next-frspec.sh
   f=$D/upstream/$src
@@ -72,11 +123,18 @@ for mode in frspec plain; do
       -e 's|^CONTEXT_LENGTH=.*|CONTEXT_LENGTH="${PENNY_CONTEXT_LENGTH:-524288}"|' \
       -e 's|--host 0\.0\.0\.0 --port 8001|--host "${PENNY_BIND_HOST:-0.0.0.0}" --port 8001|' \
       -e 's|--served-model-name pennyroyal \\|--served-model-name flash-next --api-key "$PENNY_API_KEY" \\|' "$f" > "$out"
-  # Every patch must land exactly once.
+  rewrite_start_quality "$out"
+  # Every patch must land exactly once. The upstream YaRN flag must be gone;
+  # the factor-2.0 JSON may remain only inside the 524288 arm.
   # shellcheck disable=SC2016
-  for pat in '^TARGET_MODEL="\$\{PENNY_MODEL_DIR:\?' '^NIXL=off$' '^HICACHE_SIZE_GB="\$\{PENNY_HICACHE_GB:\?PENNY_HICACHE_GB not set\}"$' '^CONTEXT_LENGTH="\$\{PENNY_CONTEXT_LENGTH:-524288\}"$' 'served-model-name flash-next --api-key "\$PENNY_API_KEY"' '--host "\$\{PENNY_BIND_HOST:-0\.0\.0\.0\}" --port 8001'; do
+  for pat in '^TARGET_MODEL="\$\{PENNY_MODEL_DIR:\?' '^NIXL=off$' '^HICACHE_SIZE_GB="\$\{PENNY_HICACHE_GB:\?PENNY_HICACHE_GB not set\}"$' '^CONTEXT_LENGTH="\$\{PENNY_CONTEXT_LENGTH:-524288\}"$' 'served-model-name flash-next --api-key "\$PENNY_API_KEY"' '--host "\$\{PENNY_BIND_HOST:-0\.0\.0\.0\}" --port 8001' ': "\$\{PENNY_REASONING_EFFORT:=xhigh\}"' 'if \[\[ "\$CONTEXT_LENGTH" == 524288 \]\]; then' 'JSON_MODEL_OVERRIDE_ARGS=\(\)' '--context-length "\$CONTEXT_LENGTH" "\$\{JSON_MODEL_OVERRIDE_ARGS\[@\]\}"'; do
     [[ $(grep -cE -- "$pat" "$out") == 1 ]] || { echo "PENNY: FATAL patch check failed in $out: $pat" >&2; exit 1; }
   done
+  if grep -qF -- '--context-length "$CONTEXT_LENGTH" --json-model-override-args "$TARGET_OVERRIDES"' "$out"; then
+    echo "PENNY: FATAL unconditional YaRN flag remains in $out" >&2
+    exit 1
+  fi
+  [[ $(grep -cF 'rope_type":"yarn"' "$out") == 1 ]] || { echo "PENNY: FATAL YaRN override must appear once, only in the 524288 arm, in $out" >&2; exit 1; }
   bash -n "$out"
 done
 echo "PENNY: start files ready (frspec, plain)"

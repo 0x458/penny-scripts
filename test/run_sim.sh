@@ -74,6 +74,24 @@ echo "--- launch argv (plain):"; tail -1 "$W/argv.jsonl" | sed "s|$W|\$W|g; s|$K
 [[ $(lastarg --hicache-storage-backend) == ABSENT ]] && ok "NIXL off: no storage backend args" || bad nixl
 [[ $(lastarg --port) == 8001 && $(lastarg --host) == 0.0.0.0 ]] && ok "--host 0.0.0.0 --port 8001" || bad port
 [[ $(lastarg --context-length) == 524288 ]] && ok "--context-length 524288" || bad "context $(lastarg --context-length)"
+ov=$(lastarg --json-model-override-args)
+[[ $ov == *'"rope_type":"yarn"'* && $ov == *'"factor":2.0'* && $ov == *'"original_max_position_embeddings":262144'* ]] && ok "524288 keeps YaRN extension" || bad "yarn at 524288: $ov"
+kw=$(lastarg --default-chat-template-kwargs)
+[[ $kw == '{"enable_thinking":true,"preserve_thinking":true,"reasoning_effort":"xhigh"}' ]] && ok "default reasoning_effort xhigh" || bad "kwargs $kw"
+grep -q "PENNY: start files ready (frspec, plain)" "$C/logs/boot.log" && ok "plain/frspec patch checks passed" || bad "patch checks"
+for sf in "$C/start-plain.sh" "$C/start-frspec.sh"; do
+  base=$(basename "$sf")
+  if [[ $(grep -cF 'if [[ "$CONTEXT_LENGTH" == 524288 ]]; then' "$sf") == 1 ]] \
+    && [[ $(grep -cF ': "${PENNY_REASONING_EFFORT:=xhigh}"' "$sf") == 1 ]] \
+    && [[ $(grep -cF 'rope_type":"yarn"' "$sf") == 1 ]] \
+    && ! grep -qF -- '--context-length "$CONTEXT_LENGTH" --json-model-override-args "$TARGET_OVERRIDES"' "$sf"; then
+    ok "quality patch in $base"
+  else bad "quality patch $base"; fi
+done
+kw=$(env -u PENNY_REASONING_EFFORT bash -c 'set -euo pipefail; : "${PENNY_REASONING_EFFORT:=xhigh}"; export PENNY_REASONING_EFFORT; source "$1"; printf %s "$DEFAULT_CHAT_TEMPLATE_KWARGS"' bash "$R/configs/pennyroyal/reasoning-effort.sh")
+[[ $kw == '{"enable_thinking":true,"preserve_thinking":true,"reasoning_effort":"xhigh"}' ]] && ok "unset PENNY_REASONING_EFFORT builds xhigh JSON" || bad "helper default $kw"
+kw=$(PENNY_REASONING_EFFORT=low bash -c 'set -euo pipefail; : "${PENNY_REASONING_EFFORT:=xhigh}"; export PENNY_REASONING_EFFORT; source "$1"; printf %s "$DEFAULT_CHAT_TEMPLATE_KWARGS"' bash "$R/configs/pennyroyal/reasoning-effort.sh")
+[[ $kw == '{"enable_thinking":true,"preserve_thinking":true,"reasoning_effort":"low"}' ]] && ok "explicit PENNY_REASONING_EFFORT=low still wins" || bad "helper override $kw"
 chk "NIXL off message in server log" grep -q "NIXL disk tier: off" "$C/logs/server-plain.log"
 chk "tailscale skipped without TS_AUTHKEY" grep -q "TS_AUTHKEY unset, skipping tailscale" "$W/container.log"
 chk "WARN public HTTP without Tailscale" grep -q "WARN ports 8001/8002 are public plain HTTP" "$W/container.log"
@@ -110,6 +128,9 @@ chk "frspec serving" waitphase serving:frspec
 chk "frspec sglang started (new argv)" waitargv "$N"
 chk "server process alive (rc null)" bash -c "curl -s -H 'Authorization: Bearer $KEY' $CTL/status | grep -q '\"rc\": null'"
 [[ $(lastarg --speculative-token-map) == "$R/configs/pennyroyal/frspec/flash-next-64k.pt" ]] && ok "frspec: --speculative-token-map pinned map" || bad "map $(lastarg --speculative-token-map)"
+ov=$(lastarg --json-model-override-args)
+[[ $ov == *'"rope_type":"yarn"'* && $ov == *'"factor":2.0'* ]] && ok "frspec 524288 keeps YaRN extension" || bad "frspec yarn: $ov"
+[[ $(lastarg --default-chat-template-kwargs) == '{"enable_thinking":true,"preserve_thinking":true,"reasoning_effort":"xhigh"}' ]] && ok "frspec default reasoning_effort xhigh" || bad "frspec kwargs $(lastarg --default-chat-template-kwargs)"
 chk "frspec start file passed upstream tokenizer check" grep -q "Verifying the pinned FR-Spec map, tokenizer" "$C/logs/server-frspec.log"
 curl -s -X POST "${A[@]}" "$CTL/mode?m=plain"; echo
 chk "back to plain" waitphase serving:plain
@@ -150,6 +171,15 @@ r=$(curl -s -w ' %{http_code}' -X POST "${A[@]}" "$CTL/config?hicache_gb=32&cont
 chk "sglang restarted with new hicache/context" waitargv "$N"
 [[ $(lastarg --hicache-size) == 32 ]] && ok "--hicache-size 32 from /config" || bad "hicache $(lastarg --hicache-size)"
 [[ $(lastarg --context-length) == 262144 ]] && ok "--context-length 262144 from /config" || bad "context $(lastarg --context-length)"
+[[ $(lastarg --json-model-override-args) == ABSENT ]] && ! tail -1 "$W/argv.jsonl" | grep -q 'yarn' && ok "262144 launch has no YaRN injection" || bad "yarn still injected at 262144: $(lastarg --json-model-override-args) $(tail -1 "$W/argv.jsonl" | tr -d '\n' | cut -c1-240)"
+[[ $(lastarg --default-chat-template-kwargs) == '{"enable_thinking":true,"preserve_thinking":true,"reasoning_effort":"xhigh"}' ]] && ok "262144 launch still defaults reasoning to xhigh" || bad "kwargs after 262144 $(lastarg --default-chat-template-kwargs)"
+N=$(nargv); curl -s -X POST "${A[@]}" "$CTL/mode?m=frspec" >/dev/null
+chk "frspec serving at context 262144" waitphase serving:frspec
+chk "frspec 262144 sglang started" waitargv "$N"
+[[ $(lastarg --context-length) == 262144 && $(lastarg --json-model-override-args) == ABSENT ]] && ! tail -1 "$W/argv.jsonl" | grep -q 'yarn' && ok "frspec 262144 launch has no YaRN injection" || bad "frspec yarn at 262144: $(lastarg --json-model-override-args)"
+[[ $(lastarg --default-chat-template-kwargs) == '{"enable_thinking":true,"preserve_thinking":true,"reasoning_effort":"xhigh"}' ]] && ok "frspec 262144 still defaults reasoning to xhigh" || bad "frspec kwargs at 262144"
+curl -s -X POST "${A[@]}" "$CTL/mode?m=plain" >/dev/null
+chk "back to plain after 262144 frspec check" waitphase serving:plain
 st | grep -q '"hicache_gb": 32' && st | grep -q '"context_length": 262144' && ok "/status shows hicache 32 context 262144" || bad "status $(st)"
 python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d["hicache_gb"]==32 and d["context_length"]==262144 and d["mode"]=="plain"' "$C/config.json" && ok "config.json saved" || bad "config.json"
 grep -qF -- "$KEY" "$C/config.json" && bad "API key in config.json" || ok "API key absent from config.json"

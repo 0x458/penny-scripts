@@ -18,7 +18,8 @@ Model pinned: `jpezzulli/OrcaRouter-Qwen3.8-Flash-Next-Uncensored-ModelOpt-NVFP4
    SGLang in this image allows `/health` without the API key (`auth.py` prefixes `/health`), so the check sends no key.
 3. `boot.sh` checks sha256 of the vendored upstream start files (`upstream/`, identical to tag pennyroyal-v3.0.2),
    patches them (model dir from `$PENNY_MODEL_DIR`, `NIXL=off`, HiCache and context from the environment,
-   `--host` from `PENNY_BIND_HOST`, `--served-model-name flash-next --api-key`),
+   `--host` from `PENNY_BIND_HOST`, `--served-model-name flash-next --api-key`,
+   YaRN only when context is 524288, server reasoning default `xhigh`),
    verifies each patch landed exactly once, optional Tailscale, then execs `ctl.py`.
 4. `ctl.py` (:8002) checks HF metadata (revision must match, size), checks disk, downloads with `hf download --revision`
    (4 tries on network errors or an incomplete result), writes `.complete`, then starts SGLang (:8001) in `PENNY_MODE`
@@ -53,6 +54,15 @@ Model pinned: `jpezzulli/OrcaRouter-Qwen3.8-Flash-Next-Uncensored-ModelOpt-NVFP4
   PENNY_RAM_GB must be the offer's RAM (gVisor cgroup showed 538 GB on a 189 GB rental).
 - Default `plain` (Chinese ~46% faster without FR-Spec); `POST /mode?m=frspec` for English/code. FR-Spec is refused if
   the model's tokenizer.json sha256 is not 0997f410... (all three whitelisted models pass).
+- Flash-Next's native context is 262144. Upstream always passes YaRN factor 2.0
+  (`original_max_position_embeddings` 262144) to reach 524288. At 262144 that override rescales RoPE and hurts
+  short text, so the generated start file adds `--json-model-override-args` only when `CONTEXT_LENGTH` is 524288.
+  Contexts 65536, 131072, and 262144 launch with no YaRN override. `POST /config` changes context on the next
+  SGLang start; the same start file picks the arm from `PENNY_CONTEXT_LENGTH`, so no reboot is required.
+- Pennyroyal `reasoning-effort.sh` defaults to medium. Generated start files set `PENNY_REASONING_EFFORT` to
+  `xhigh` when it is unset, which becomes `--default-chat-template-kwargs` with `reasoning_effort=xhigh`.
+  A request that sends `reasoning_effort` still overrides that server default. An explicit
+  `PENNY_REASONING_EFFORT` in the environment (for example `low`) still wins over `xhigh`.
 - API key: SGLang prints server_args with `api_key` in clear. ctl.py reads SGLang stdout/stderr through a pipe and replaces
   the key with `<API_KEY>` before it reaches the container log (`vastai logs`), /cache/logs or /log. Residual: the key is
   in SGLang's argv inside the container and in the Vast instance env (visible to whoever holds the Vast account).
