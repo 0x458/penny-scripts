@@ -1,6 +1,10 @@
 # Whitelist for ctl.py POST /switch. One "org/repo@<40-hex commit>" per line. Lives in the repo, so edit +
-# reboot (bootstrap re-pulls) changes it without recreating the instance. All three have tokenizer.json
-# sha256 0997f410... (passes the FR-Spec check), 135.25 GB each (HF API, 2026-10-19).
+# reboot (bootstrap re-pulls) changes it without recreating the instance. The Flash-Next three have
+# tokenizer.json sha256 0997f410... (passes the FR-Spec check), 135.25 GB each (HF API, 2026-10-19).
+# 27B is AWQ W4A16 of orcarouter/Qwen3.8-27B-Uncensored (18.21 GiB of weight files, HF 2026-10-21).
+# Draft incoai/Qwen3.8-27B-DFlash2@015e795645c74b1a0eeef3b570031fb62e769bc5 (3.58 GiB) is downloaded
+# with it and is not a /switch target. Override the pin with PENNY_27B_MODEL only if that spec is listed here.
 jpezzulli/OrcaRouter-Qwen3.8-Flash-Next-Uncensored-ModelOpt-NVFP4@f24d2b68ff2814f24455ae86717be276619b5664
 dealignai/Qwen3.8-Flash-Next-ABLITERATED-NVFP4@be794b990578ef3031eccf9f28e675a289a09ee9
 RadixArk/Qwen3.8-Flash-Next-NVFP4@7b719225242aacd3dbd3f9407468c2ee9a9d2594
+Ar4ikov/Qwen3.8-27B-Uncensored-AWQ-W4A16-ASYM@d07667d03a5dbfebd02a4eaa55348b97f35d1935

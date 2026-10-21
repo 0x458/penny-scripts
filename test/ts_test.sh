@@ -77,4 +77,56 @@ if [[ $rc == 0 && $okline == 1 ]] && grep -q "WARN tailscale hostname" "$W/out.l
 else echo "FAIL ts renamed"; FAIL=$((FAIL+1)); fi
 grep -q "tskey-fake" "$W/out.log" "$W/ts.log" && { echo "FAIL ts renamed: authkey leaked"; FAIL=$((FAIL+1)); } || { echo "PASS ts renamed: authkey not in logs"; PASS=$((PASS+1)); }
 pkill -f "$C/ts/sock" 2>/dev/null
+# Flash-Next start files stay byte-identical when the 27B file is generated beside them.
+PLAIN_SHA=c34a6001c201f5c4a11b586330098fcc1bb77348771f92927bed6225214a676e
+FR_SHA=fd255957e074e495cdb9e207ffd4c0f799c7175f47155df5b7b4f50c90ef5207
+W=$(mktemp -d /tmp/pv5ts.XXXX); C=$W/cache; mkdir -p "$C"
+PENNY_CACHE=$C PENNY_API_KEY=k PENNY_RAM_GB=189 PENNY_PY=true timeout 30 bash "$BOOT" > "$W/out.log" 2>&1; rc=$?
+gp=$(sha256sum "$C/start-plain.sh" | awk 'NR==1{print $1}'); gf=$(sha256sum "$C/start-frspec.sh" | awk 'NR==1{print $1}')
+echo "[flash_sha] rc=$rc plain=$gp frspec=$gf"
+if [[ $rc == 0 && $gp == "$PLAIN_SHA" && $gf == "$FR_SHA" ]]; then echo "PASS ts flash sha256 unchanged"; PASS=$((PASS+1))
+else echo "FAIL ts flash sha256"; FAIL=$((FAIL+1)); fi
+if [[ -f $C/start-27b.sh ]] && grep -q 'compressed-tensors' "$C/start-27b.sh" && grep -q ':-126784' "$C/start-27b.sh" \
+  && grep -q ':=xhigh' "$C/start-27b.sh" && grep -q '0.86' "$C/start-27b.sh" && grep -q 'DFLASH' "$C/start-27b.sh"; then
+  echo "PASS ts 27b start file is generated beside flash"; PASS=$((PASS+1))
+else echo "FAIL ts 27b start file beside flash"; FAIL=$((FAIL+1)); fi
+# 32 GB card: HiCache off, context 126784, and the flash files still match.
+W=$(mktemp -d /tmp/pv5ts.XXXX); C=$W/cache; mkdir -p "$C"
+PENNY_CACHE=$C PENNY_API_KEY=k PENNY_RAM_GB=31 PENNY_MODE=27b PENNY_PY=true timeout 30 bash "$BOOT" > "$W/out.log" 2>&1; rc=$?
+gp=$(sha256sum "$C/start-plain.sh" | awk 'NR==1{print $1}'); gf=$(sha256sum "$C/start-frspec.sh" | awk 'NR==1{print $1}')
+echo "[27b] rc=$rc :: $(grep -E '27B HiCache|FATAL' "$W/out.log" | tr '\n' '|' | cut -c1-240)"
+s27=$C/start-27b.sh
+if [[ $rc == 0 ]] && grep -q "27B HiCache off" "$W/out.log" && grep -q "context 126784" "$W/out.log" \
+  && grep -q 'PENNY_27B_QUANTIZATION:-compressed-tensors' "$s27" \
+  && grep -q 'PENNY_27B_CONTEXT_LENGTH:-126784' "$s27" \
+  && grep -q 'PENNY_DRAFT_MODEL_DIR' "$s27" \
+  && grep -q 'PENNY_27B_MEM_FRACTION:-0.86' "$s27" \
+  && grep -q 'PENNY_27B_MAMBA_SLOTS:-8' "$s27" \
+  && grep -q 'speculative-algorithm DFLASH' "$s27" \
+  && grep -q ':=xhigh' "$s27" \
+  && grep -q 'qwen3.8-27b' "$s27" \
+  && [[ $gp == "$PLAIN_SHA" && $gf == "$FR_SHA" ]] && bash -n "$s27"; then
+  echo "PASS ts 27b: HiCache off, context 126784, quant/draft/mem/mamba/xhigh, flash sha unchanged"; PASS=$((PASS+1))
+else echo "FAIL ts 27b"; FAIL=$((FAIL+1)); fi
+# Flash-Next bakes the name "$PENNY_API_KEY", not the value. Two placeholders must
+# match the pre-PR sha256, and the placeholder text must not appear in the files.
+for key in placeholder-not-a-real-key second-placeholder; do
+  W=$(mktemp -d /tmp/pv5ts.XXXX); C=$W/cache; mkdir -p "$C"
+  PENNY_CACHE=$C PENNY_API_KEY=$key PENNY_RAM_GB=189 PENNY_PY=true timeout 30 bash "$BOOT" > "$W/out.log" 2>&1; rc=$?
+  gp=$(sha256sum "$C/start-plain.sh" | awk 'NR==1{print $1}'); gf=$(sha256sum "$C/start-frspec.sh" | awk 'NR==1{print $1}')
+  echo "[api_key $key] rc=$rc plain=$gp frspec=$gf"
+  if [[ $rc == 0 && $gp == "$PLAIN_SHA" && $gf == "$FR_SHA" ]] \
+    && grep -qF -- '--api-key "$PENNY_API_KEY"' "$C/start-plain.sh" \
+    && grep -qF -- '--api-key "$PENNY_API_KEY"' "$C/start-frspec.sh" \
+    && ! grep -qF -- "$key" "$C/start-plain.sh" "$C/start-frspec.sh"; then
+    echo "PASS ts api-key $key: flash scripts match pre-PR sha and omit the key value"; PASS=$((PASS+1))
+  else echo "FAIL ts api-key $key"; FAIL=$((FAIL+1)); fi
+done
+# No key: boot stops before it writes a start file, so there is no second variant.
+W=$(mktemp -d /tmp/pv5ts.XXXX); C=$W/cache; mkdir -p "$C"
+env -u PENNY_API_KEY PENNY_CACHE=$C PENNY_RAM_GB=189 PENNY_PY=true timeout 30 bash "$BOOT" > "$W/out.log" 2>&1; rc=$?
+echo "[api_key unset] rc=$rc files=$( [[ -f $C/start-plain.sh || -f $C/start-frspec.sh ]] && echo present || echo absent )"
+if [[ $rc != 0 && ! -f $C/start-plain.sh && ! -f $C/start-frspec.sh ]] && grep -q 'PENNY_API_KEY' "$W/out.log"; then
+  echo "PASS ts api-key unset: no flash start file written"; PASS=$((PASS+1))
+else echo "FAIL ts api-key unset"; FAIL=$((FAIL+1)); fi
 echo "=== TS RESULT: $PASS passed, $FAIL failed"
