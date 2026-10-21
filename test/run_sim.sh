@@ -15,6 +15,11 @@ ORCA=jpezzulli/OrcaRouter-Qwen3.8-Flash-Next-Uncensored-ModelOpt-NVFP4@f24d2b68f
 DEAL=dealignai/Qwen3.8-Flash-Next-ABLITERATED-NVFP4@be794b990578ef3031eccf9f28e675a289a09ee9
 BADTOK=testorg/BadTok-NVFP4@1111111111111111111111111111111111111111
 HUGE=testorg/Huge-NVFP4@2222222222222222222222222222222222222222
+M27=Ar4ikov/Qwen3.8-27B-Uncensored-AWQ-W4A16-ASYM@d07667d03a5dbfebd02a4eaa55348b97f35d1935
+DRAFT27=incoai/Qwen3.8-27B-DFlash2@015e795645c74b1a0eeef3b570031fb62e769bc5
+# Flash-Next start files generated from the pinned pennyroyal-v3.0.2 sources. Mode 27b must not change these.
+PLAIN_SHA=c34a6001c201f5c4a11b586330098fcc1bb77348771f92927bed6225214a676e
+FR_SHA=fd255957e074e495cdb9e207ffd4c0f799c7175f47155df5b7b4f50c90ef5207
 KEY="sk-test-$(head -c 12 /dev/urandom | od -An -tx1 | tr -d ' \n')"
 GHT="github_pat_FAKE$(head -c 8 /dev/urandom | od -An -tx1 | tr -d ' \n')"
 
@@ -26,7 +31,14 @@ H=$W/hf; for n in OrcaRouter-Qwen3.8-Flash-Next-Uncensored-ModelOpt-NVFP4 Qwen3.
   mkdir -p "$H/$n"; echo '{"architectures":["fake"]}' > "$H/$n/config.json"; echo '{}' > "$H/$n/model.safetensors.index.json"
   head -c 1000000 /dev/urandom > "$H/$n/model-00001-of-00001.safetensors"; cp "$TOK" "$H/$n/tokenizer.json"; done
 echo '{"different":1}' > "$H/BadTok-NVFP4/tokenizer.json"
-printf '%s\n' "$ORCA" "$DEAL" "$BADTOK" "$HUGE" > "$W/allow.test"
+# 27B target needs the index the upstream script checks; the draft is one safetensors file.
+mkdir -p "$H/Qwen3.8-27B-Uncensored-AWQ-W4A16-ASYM" "$H/Qwen3.8-27B-DFlash2"
+echo '{"architectures":["Qwen3_5ForConditionalGeneration"],"quantization_config":{"quant_method":"compressed-tensors"}}' > "$H/Qwen3.8-27B-Uncensored-AWQ-W4A16-ASYM/config.json"
+echo '{}' > "$H/Qwen3.8-27B-Uncensored-AWQ-W4A16-ASYM/model.safetensors.index.json"
+head -c 1000000 /dev/urandom > "$H/Qwen3.8-27B-Uncensored-AWQ-W4A16-ASYM/model-00001-of-00001.safetensors"
+echo '{"architectures":["DFlashDraftModel"]}' > "$H/Qwen3.8-27B-DFlash2/config.json"
+head -c 1000000 /dev/urandom > "$H/Qwen3.8-27B-DFlash2/model.safetensors"
+printf '%s\n' "$ORCA" "$DEAL" "$BADTOK" "$HUGE" "$M27" > "$W/allow.test"
 BARE=$W/remote.git; git init -q --bare "$BARE"; SRC=$W/src; mkdir -p "$SRC"
 cp -r "$V5/boot.sh" "$V5/ctl.py" "$V5/bootstrap.sh" "$V5/models.allow" "$V5/upstream" "$SRC/"
 git -C "$SRC" init -q -b main && git -C "$SRC" add -A && git -C "$SRC" -c user.email=t@t -c user.name=t commit -qm v5 && git -C "$SRC" push -q "$BARE" main
@@ -79,6 +91,8 @@ ov=$(lastarg --json-model-override-args)
 kw=$(lastarg --default-chat-template-kwargs)
 [[ $kw == '{"enable_thinking":true,"preserve_thinking":true,"reasoning_effort":"xhigh"}' ]] && ok "default reasoning_effort xhigh" || bad "kwargs $kw"
 grep -q "PENNY: start files ready (frspec, plain)" "$C/logs/boot.log" && ok "plain/frspec patch checks passed" || bad "patch checks"
+[[ $(sha256sum "$C/start-plain.sh" | awk 'NR==1{print $1}') == "$PLAIN_SHA" ]] && ok "start-plain.sh sha256 $PLAIN_SHA" || bad "start-plain.sh $(sha256sum "$C/start-plain.sh")"
+[[ $(sha256sum "$C/start-frspec.sh" | awk 'NR==1{print $1}') == "$FR_SHA" ]] && ok "start-frspec.sh sha256 $FR_SHA" || bad "start-frspec.sh $(sha256sum "$C/start-frspec.sh")"
 for sf in "$C/start-plain.sh" "$C/start-frspec.sh"; do
   base=$(basename "$sf")
   if [[ $(grep -cF 'if [[ "$CONTEXT_LENGTH" == 524288 ]]; then' "$sf") == 1 ]] \
@@ -232,6 +246,8 @@ env -u PENNY_RAM_GB PENNY_CACHE="$C2" timeout 5 bash "$C2/penny-vast/boot.sh" > 
 [[ $rc != 0 ]] && grep -q "FATAL PENNY_RAM_GB is required" "$W/c4.log" && ok "PENNY_RAM_GB unset -> refuses to start (rc=$rc)" || bad "ram unset rc=$rc"
 PENNY_CACHE=$C2 PENNY_RAM_GB=100 timeout 5 bash "$C2/penny-vast/boot.sh" > "$W/c3.log" 2>&1; rc=$?
 [[ $rc != 0 ]] && grep -q "too small" "$W/c3.log" && ok "RAM 100 -> refuses to start (rc=$rc): $(grep FATAL "$W/c3.log")" || bad "ram 100 rc=$rc"
+PENNY_CACHE=$C2 PENNY_RAM_GB=31 timeout 5 bash "$C2/penny-vast/boot.sh" > "$W/c31.log" 2>&1; rc=$?
+[[ $rc != 0 ]] && grep -q "too small" "$W/c31.log" && ! grep -q "27B HiCache off" "$W/c31.log" && ok "RAM 31 without mode 27b still refuses (Flash-Next)" || bad "ram 31 rc=$rc $(grep FATAL "$W/c31.log")"
 pkill -f "c2/penny-vast/ctl.py" 2>/dev/null; pkill -f "$R/.venv/bin/sglang" 2>/dev/null
 
 echo "=== 7. bootstrap fallbacks"
@@ -354,6 +370,70 @@ kill "$HPID" 2>/dev/null || true
 wait "$HPID" 2>/dev/null || true
 hl=$(grep -h '^sglang_healthy()' "$V5/boot.sh" "$V5/bootstrap.sh")
 [[ $(printf '%s\n' "$hl" | grep -c 'curl -fsS ') == 2 ]] && ! printf '%s\n' "$hl" | grep -E -q 'PENNY_API_KEY|Authorization' && ok "health check sends no API key" || bad "health check line: $hl"
+
+echo "=== 7h. 27B mode, one RTX 5090, RAM 31 GB"
+pkill -f "$R/.venv/bin/sglang" 2>/dev/null || true
+sleep 1
+python3 "$T/fake_hf_api.py" 18082 & API27=$!
+ready=0
+for _ in $(seq 25); do curl -sf -m 1 -o /dev/null "http://127.0.0.1:18082/api/models/incoai/Qwen3.8-27B-DFlash2/revision/015e795645c74b1a0eeef3b570031fb62e769bc5?blobs=true" && ready=1 && break; sleep 0.2; done
+[[ $ready == 1 ]] && ok "27b fake HF API up" || bad "27b fake HF API"
+C27=$W/c27; mkdir -p "$C27"; : > "$W/argv-27b.jsonl"
+env -u FAKE_CRASH_FILE PENNY_CACHE=$C27 PENNY_MODE=27b PENNY_RAM_GB=31 PENNY_CTL_PORT=18027 \
+  HF_ENDPOINT=http://127.0.0.1:18082 FAKE_ARGV_OUT=$W/argv-27b.jsonl FAKE_HF_LOG=$W/hf-27b.log \
+  bash "$V5/boot.sh" > "$W/c27.log" 2>&1 &
+B27=$!
+S27=http://127.0.0.1:18027
+st27() { curl -s -m 5 -H "Authorization: Bearer $KEY" "$S27/status"; }
+a27() { tail -1 "$W/argv-27b.jsonl" | python3 -c 'import json,sys; a=json.load(sys.stdin); k=sys.argv[1]; print(a[a.index(k)+1] if k in a else "ABSENT")' "$1"; }
+up27=0
+for _ in $(seq 70); do st27 | grep -q '"phase": "serving:27b"' && up27=1 && break; sleep 1; done
+[[ $up27 == 1 ]] && ok "27b phase serving:27b" || bad "27b phase: $(st27) :: $(tail -20 "$W/c27.log" | tr '\n' '|')"
+[[ $(a27 --model-path) == "$C27/models/Qwen3.8-27B-Uncensored-AWQ-W4A16-ASYM" ]] && ok "27b --model-path is the AWQ dir" || bad "27b model $(a27 --model-path)"
+[[ $(a27 --quantization) == compressed-tensors ]] && ok "27b --quantization compressed-tensors" || bad "27b quant $(a27 --quantization)"
+[[ $(a27 --speculative-draft-model-path) == "$C27/models/Qwen3.8-27B-DFlash2" ]] && ok "27b draft path is DFlash2" || bad "27b draft $(a27 --speculative-draft-model-path)"
+[[ $(a27 --speculative-algorithm) == DFLASH ]] && ok "27b --speculative-algorithm DFLASH" || bad "27b algo $(a27 --speculative-algorithm)"
+[[ $(a27 --speculative-num-draft-tokens) == 8 ]] && ok "27b draft tokens 8" || bad "27b tokens $(a27 --speculative-num-draft-tokens)"
+[[ $(a27 --speculative-draft-window-size) == 2048 ]] && ok "27b draft window 2048" || bad "27b window $(a27 --speculative-draft-window-size)"
+[[ $(a27 --speculative-draft-model-quantization) == unquant ]] && ok "27b draft quant unquant" || bad "27b draft quant $(a27 --speculative-draft-model-quantization)"
+[[ $(a27 --context-length) == 126784 && $(a27 --max-total-tokens) == 126784 ]] && ok "27b context and max-total-tokens 126784" || bad "27b context $(a27 --context-length) total $(a27 --max-total-tokens)"
+[[ $(a27 --mem-fraction-static) == 0.86 ]] && ok "27b mem-fraction-static 0.86" || bad "27b frac $(a27 --mem-fraction-static)"
+[[ $(a27 --max-mamba-cache-size) == 8 ]] && ok "27b max-mamba-cache-size 8" || bad "27b mamba $(a27 --max-mamba-cache-size)"
+[[ $(a27 --kv-cache-dtype) == fp8_e4m3 ]] && ok "27b kv-cache-dtype fp8_e4m3" || bad "27b kv $(a27 --kv-cache-dtype)"
+[[ $(a27 --served-model-name) == qwen3.8-27b ]] && ok "27b served-model-name qwen3.8-27b" || bad "27b name $(a27 --served-model-name)"
+[[ $(a27 --api-key) == "$KEY" ]] && ok "27b api key passed" || bad "27b api key"
+kw27=$(a27 --default-chat-template-kwargs)
+[[ $kw27 == '{"enable_thinking":true,"preserve_thinking":true,"reasoning_effort":"xhigh"}' ]] && ok "27b default reasoning_effort xhigh" || bad "27b kwargs $kw27"
+[[ $(a27 --json-model-override-args) == ABSENT && $(a27 --hicache-size) == ABSENT && $(a27 --enable-hierarchical-cache) == ABSENT && $(a27 --hicache-storage-backend) == ABSENT ]] && ok "27b launch has no YaRN, no HiCache, no NIXL" || bad "27b flags yarn=$(a27 --json-model-override-args) hicache=$(a27 --hicache-size) nixl=$(a27 --hicache-storage-backend)"
+grep -q ': "${PENNY_REASONING_EFFORT:=xhigh}"' "$C27/start-27b.sh" && ok "27b start file defaults PENNY_REASONING_EFFORT to xhigh" || bad "27b xhigh default"
+grep -q "27B HiCache off" "$W/c27.log" && grep -q "context 126784" "$W/c27.log" && ok "27b boot log: HiCache off, context 126784" || bad "27b boot log $(grep -E '27B|FATAL' "$W/c27.log" | tr '\n' '|')"
+[[ -f $C27/models/Qwen3.8-27B-DFlash2/.complete && -f $C27/models/Qwen3.8-27B-DFlash2/model.safetensors ]] && ok "27b draft downloaded beside the target" || bad "27b draft files"
+[[ -f $C27/models/Qwen3.8-27B-Uncensored-AWQ-W4A16-ASYM/model.safetensors.index.json ]] && ok "27b target checkpoint index present" || bad "27b target index"
+[[ $(sha256sum "$C27/start-plain.sh" | awk 'NR==1{print $1}') == "$PLAIN_SHA" && $(sha256sum "$C27/start-frspec.sh" | awk 'NR==1{print $1}') == "$FR_SHA" ]] && ok "27b boot kept flash start files byte-identical" || bad "27b boot changed flash sha plain=$(sha256sum "$C27/start-plain.sh") frspec=$(sha256sum "$C27/start-frspec.sh")"
+N27=$(wc -l < "$W/argv-27b.jsonl")
+r=$(curl -s -w ' %{http_code}' -X POST -H "Authorization: Bearer $KEY" "$S27/config?context=65536"); echo "$r"
+[[ $r == *" 200" ]] && ok "27b /config context=65536 -> 200" || bad "27b context 65536 $r"
+for _ in $(seq 40); do (( $(wc -l < "$W/argv-27b.jsonl") > N27 )) && break; sleep 0.5; done
+[[ $(a27 --context-length) == 65536 && $(a27 --max-total-tokens) == 65536 && $(a27 --quantization) == compressed-tensors && $(a27 --json-model-override-args) == ABSENT ]] && ok "27b relaunch context 65536, still AWQ, no YaRN" || bad "27b 65536 context=$(a27 --context-length) quant=$(a27 --quantization)"
+r=$(curl -s -w ' %{http_code}' -X POST -H "Authorization: Bearer $KEY" "$S27/config?context=524288")
+[[ $r == *" 400" && $r == *"32768|65536|98304|126784"* ]] && ok "27b rejects context 524288" || bad "27b context 524288 $r"
+r=$(curl -s -w ' %{http_code}' -X POST -H "Authorization: Bearer $KEY" "$S27/config?hicache_gb=8")
+[[ $r == *" 400" && $r == *"hicache_gb must be 0"* ]] && ok "27b RAM 31 rejects hicache_gb=8" || bad "27b hicache 8 $r"
+r=$(curl -s -w ' %{http_code}' -X POST -H "Authorization: Bearer $KEY" "$S27/config?hicache_gb=0")
+[[ $r == *" 200" ]] && ok "27b accepts hicache_gb=0" || bad "27b hicache 0 $r"
+st27 | grep -q '"mode": "27b"' && st27 | grep -q '"context_length": 65536' && st27 | grep -q '"hicache_gb": 0' && st27 | grep -q "\"active\": \"$M27\"" && ok "27b status mode, context 65536, hicache 0, AWQ active" || bad "27b status $(st27)"
+r=$(curl -s -w ' %{http_code}' -X POST -H "Authorization: Bearer $KEY" "$S27/mode?m=plain")
+[[ $r == *" 409" ]] && ok "27b model refuses /mode plain" || bad "27b to plain $r"
+r=$(curl -s -w ' %{http_code}' -X POST -H "Authorization: Bearer $KEY" "$S27/switch?model=$ORCA&m=27b")
+[[ $r == *" 400" ]] && ok "27b mode refuses Flash-Next weights" || bad "27b switch orca $r"
+grep -qF -- "$KEY" "$W/c27.log" "$C27/logs/server-27b.log" && bad "API key in 27b logs" || ok "API key absent from 27b logs"
+grep -q -- "--revision d07667d03a5dbfebd02a4eaa55348b97f35d1935" "$W/hf-27b.log" && grep -q -- "--revision 015e795645c74b1a0eeef3b570031fb62e769bc5" "$W/hf-27b.log" && ok "27b downloads pinned target and draft revisions" || bad "27b hf log $(tr '\n' '|' < "$W/hf-27b.log")"
+kill "$B27" 2>/dev/null || true
+pkill -f "$C27" 2>/dev/null || true
+kill "$API27" 2>/dev/null || true
+wait "$B27" 2>/dev/null || true
+wait "$API27" 2>/dev/null || true
+pkill -f "$R/.venv/bin/sglang" 2>/dev/null || true
 
 echo "=== 8. vast search query (offline parse with the installed vastai CLI parser; no API call)"
 VPY=/home/box/.local/share/pipx/venvs/vastai/bin/python

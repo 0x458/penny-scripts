@@ -1,5 +1,6 @@
 # Penny control server (v5, based on v4-orca): auth'd status/log/mode-switch + whitelisted model download/switch.
 # POST /config writes /cache/config.json (mode, HiCache, context, whitelisted model) and restarts SGLang.
+# Mode 27b serves the pinned Qwen3.8-27B AWQ with its DFlash2 draft. It does not serve Flash-Next weights.
 # POST /upgrade records a release tag in /cache/penny-ref; the next vastai reboot fetches it. No arbitrary exec:
 # subprocess only with fixed argument lists (never shell=True); the API key is masked in everything this process
 # prints or serves (SGLang prints server_args incl. api_key at startup).
@@ -19,10 +20,17 @@ RESERVE_GB = float(os.environ.get("PENNY_DISK_RESERVE_GB", "40"))  # JIT caches 
 ALLOW_FILE = os.environ.get("PENNY_ALLOW_FILE", os.path.join(os.path.dirname(os.path.abspath(__file__)), "models.allow"))
 CFG_PATH = C + "/config.json"; REF_PATH = C + "/penny-ref"
 CONTEXTS = {65536, 131072, 262144, 524288}
+CONTEXTS_27B = {32768, 65536, 98304, 126784}
+CONTEXT_27B_DEFAULT = 126784
 HICACHE_DEFAULT = 48  # ceiling, and the size used, when PENNY_RAM_GB is unset
 TAG_RE = re.compile(r"v[0-9]+\.[0-9]+(?:\.[0-9]+)?")
 REPO_URL = os.environ.get("PENNY_REPO_URL", "")
 DEFAULT = "jpezzulli/OrcaRouter-Qwen3.8-Flash-Next-Uncensored-ModelOpt-NVFP4@f24d2b68ff2814f24455ae86717be276619b5664"
+# AWQ W4A16 of orcarouter/Qwen3.8-27B-Uncensored. Chosen, not TBD: it is a real uncensored 4-bit
+# checkpoint and it fits a 32 GB card with the DFlash2 draft. PENNY_27B_MODEL may name another
+# whitelisted spec. The draft is not a /switch target.
+MODEL_27B_PIN = "Ar4ikov/Qwen3.8-27B-Uncensored-AWQ-W4A16-ASYM@d07667d03a5dbfebd02a4eaa55348b97f35d1935"
+DRAFT_27B_PIN = "incoai/Qwen3.8-27B-DFlash2@015e795645c74b1a0eeef3b570031fb62e769bc5"
 FRSPEC_TOK_SHA = "0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3"   # what start-flash-next-frspec.sh demands
 SPEC_RE = re.compile(r"([A-Za-z0-9][A-Za-z0-9_-]{0,38})/([A-Za-z0-9][A-Za-z0-9_-]*(?:\.[A-Za-z0-9_-]+)*)@([0-9a-f]{40})")
 os.makedirs(LOG, exist_ok=True); os.makedirs(ROOT, exist_ok=True)
@@ -66,13 +74,48 @@ def hicache_max():
     try: ram = int(raw)
     except ValueError: return HICACHE_DEFAULT
     return ram - 100 if ram > 0 else HICACHE_DEFAULT
-def hicache_ok(n):
-    """None if n is an allowed HiCache size; else an error string."""
+def model_27b():
+    """Whitelisted 27B spec. PENNY_27B_MODEL wins only when it is on the allow list."""
+    cand = os.environ.get("PENNY_27B_MODEL", "")
+    if cand and not valid(cand): return cand
+    return MODEL_27B_PIN
+def draft_27b():
+    """DFlash2 draft downloaded beside the 27B target. Not a /switch model."""
+    cand = os.environ.get("PENNY_27B_DRAFT", "")
+    if SPEC_RE.fullmatch(cand) and len(cand) < 200: return cand
+    return DRAFT_27B_PIN
+def mode_fits(spec, mode):
+    """27b serves only the pinned 27B spec. plain and frspec never serve it."""
+    if mode == "27b": return spec == model_27b()
+    return spec != model_27b()
+def hicache_cap_27b():
+    """0 when RAM is missing or under 108 GB (no pinned host pool). Else min(96, RAM-100)."""
+    raw = os.environ.get("PENNY_RAM_GB")
+    if not raw: return 0
+    try: ram = int(raw)
+    except ValueError: return 0
+    if ram < 108: return 0
+    return min(96, ram - 100)
+def hicache_ok(n, mode="flash"):
+    """None if n is an allowed HiCache size; else an error string. mode 27b uses the 5090 rules."""
+    if mode == "27b": return hicache_ok_27b(n)
     if isinstance(n, bool) or not isinstance(n, int): return "hicache_gb"
     cap = hicache_max()
     if n < 8 or n > cap: return f"hicache_gb must be 8..{cap}"
     return None
-def context_ok(n):
+def hicache_ok_27b(n):
+    if isinstance(n, bool) or not isinstance(n, int): return "hicache_gb"
+    cap = hicache_cap_27b()
+    if cap == 0:
+        if n != 0: return "hicache_gb must be 0"
+        return None
+    if n == 0: return None
+    if n < 8 or n > cap: return f"hicache_gb must be 0 or 8..{cap}"
+    return None
+def context_ok(n, mode="flash"):
+    if mode == "27b":
+        if isinstance(n, bool) or n not in CONTEXTS_27B: return "context must be 32768|65536|98304|126784"
+        return None
     if isinstance(n, bool) or n not in CONTEXTS: return "context must be 65536|131072|262144|524288"
     return None
 def atomic_write(path, text):
@@ -93,19 +136,33 @@ def save_cfg():
         os.fsync(f.fileno())
     os.replace(tmp, CFG_PATH)
 def apply_runtime():
-    os.environ["PENNY_HICACHE_GB"] = str(st["hicache_gb"])
-    os.environ["PENNY_CONTEXT_LENGTH"] = str(st["context"])
-def pick_model(cfg):
+    if st["mode"] == "27b":
+        os.environ["PENNY_27B_HICACHE_GB"] = str(st["hicache_gb"])
+        os.environ["PENNY_27B_CONTEXT_LENGTH"] = str(st["context"])
+    else:
+        os.environ["PENNY_HICACHE_GB"] = str(st["hicache_gb"])
+        os.environ["PENNY_CONTEXT_LENGTH"] = str(st["context"])
+def pick_model(cfg, mode):
+    fallback = model_27b() if mode == "27b" else DEFAULT
     cm = cfg.get("model")
     if isinstance(cm, str) and valid(cm): print(f"PENNY: config model {cm!r} rejected ({valid(cm)}), using fallback", flush=True)
-    for cand in (cm, rd(C + "/active"), os.environ.get("PENNY_MODEL", ""), DEFAULT):
-        if isinstance(cand, str) and not valid(cand): return cand
-    return DEFAULT
+    for cand in (cm, rd(C + "/active"), os.environ.get("PENNY_MODEL", ""), fallback):
+        if isinstance(cand, str) and not valid(cand) and mode_fits(cand, mode): return cand
+    return fallback
 def pick_mode(cfg):
     for cand in (cfg.get("mode"), rd(C + "/mode"), os.environ.get("PENNY_MODE", "")):  # default plain: Chinese is faster without FR-Spec
-        if cand in ("frspec", "plain"): return cand
+        if cand in ("frspec", "plain", "27b"): return cand
     return "plain"
-def pick_hicache(cfg):
+def pick_hicache(cfg, mode="flash"):
+    if mode == "27b":
+        h = cfg.get("hicache_gb")
+        if isinstance(h, int) and not isinstance(h, bool) and not hicache_ok(h, "27b"): return h
+        raw = os.environ.get("PENNY_27B_HICACHE_GB")
+        if raw is not None:
+            try: h = int(raw)
+            except ValueError: h = None
+            if isinstance(h, int) and not isinstance(h, bool) and not hicache_ok(h, "27b"): return h
+        return hicache_cap_27b()
     h = cfg.get("hicache_gb")
     if isinstance(h, int) and not isinstance(h, bool) and not hicache_ok(h): return h
     try: h = int(os.environ["PENNY_HICACHE_GB"])
@@ -114,13 +171,32 @@ def pick_hicache(cfg):
         cap = hicache_max()
         h = cap if cap >= 8 else 8
     return h
-def pick_context(cfg):
+def pick_context(cfg, mode="flash"):
+    if mode == "27b":
+        c = cfg.get("context_length")
+        if isinstance(c, int) and not isinstance(c, bool) and not context_ok(c, "27b"): return c
+        raw = os.environ.get("PENNY_27B_CONTEXT_LENGTH")
+        if raw is not None:
+            try: c = int(raw)
+            except ValueError: c = None
+            if isinstance(c, int) and not isinstance(c, bool) and not context_ok(c, "27b"): return c
+        return CONTEXT_27B_DEFAULT
     c = cfg.get("context_length")
     if isinstance(c, int) and not isinstance(c, bool) and not context_ok(c): return c
     return 524288
+def clamp_runtime(mode):
+    """Make stored HiCache and context legal for mode. A no-op when they already are."""
+    if context_ok(st["context"], mode):
+        st["context"] = CONTEXT_27B_DEFAULT if mode == "27b" else 524288
+    if hicache_ok(st["hicache_gb"], mode):
+        if mode == "27b": st["hicache_gb"] = hicache_cap_27b()
+        else:
+            cap = hicache_max()
+            st["hicache_gb"] = cap if cap >= 8 else 8
 
 cfg0 = load_cfg()
-st = {"mode": pick_mode(cfg0), "active": pick_model(cfg0), "hicache_gb": pick_hicache(cfg0), "context": pick_context(cfg0),
+mode0 = pick_mode(cfg0)
+st = {"mode": mode0, "active": pick_model(cfg0, mode0), "hicache_gb": pick_hicache(cfg0, mode0), "context": pick_context(cfg0, mode0),
       "proc": None, "started": None, "phase": "boot", "job": None, "err": None, "restarts": 0}
 lock = threading.Lock()
 apply_runtime(); save_cfg()
@@ -139,6 +215,7 @@ def launch(manual=True):
     path = f"{LOG}/server-{m}.log"
     env = {k: v for k, v in os.environ.items() if k not in ("GH_TOKEN", "TS_AUTHKEY", "HF_TOKEN")}
     env["PENNY_MODEL_DIR"] = mdir(a)
+    if m == "27b": env["PENNY_DRAFT_MODEL_DIR"] = mdir(draft_27b())
     with open(path, "ab") as f: f.write(f"\n==== launch {m} {a} {time.ctime()} ====\n".encode())
     p = subprocess.Popen(["bash", f"{START}/start-{m}.sh"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True, env=env)
     st.update(proc=p, started=time.time(), phase="serving:" + m)
@@ -212,8 +289,15 @@ def job(spec, mode):
             err = download(spec)
             if not err or not err.startswith(("HF metadata", "downloader", "incomplete")) or i == RETRIES - 1: break
             print(f"PENNY: download attempt {i+1} failed ({err}); retry in {RETRY_DELAY*(i+1):g}s", flush=True); time.sleep(RETRY_DELAY * (i + 1))
+        if not err and mode == "27b":
+            draft = draft_27b()
+            for i in range(RETRIES):
+                err = download(draft)
+                if not err or not err.startswith(("HF metadata", "downloader", "incomplete")) or i == RETRIES - 1: break
+                print(f"PENNY: download attempt {i+1} failed ({err}); retry in {RETRY_DELAY*(i+1):g}s", flush=True); time.sleep(RETRY_DELAY * (i + 1))
         if err: st.update(err=err, phase="error" if st["proc"] is None else st["phase"]); print("PENNY: ERROR " + err, flush=True); return
         with lock:
+            clamp_runtime(mode)
             stop(); st.update(active=spec, mode=mode, err=None); atomic_write(C + "/active", spec); atomic_write(C + "/mode", mode); save_cfg(); launch()
     finally: st["job"] = None
 def start_job(spec, mode):
@@ -249,7 +333,8 @@ class H(http.server.BaseHTTPRequestHandler):
             try: n = max(1, min(2000, int(q.get("n", ["80"])[0])))
             except ValueError: return self.out(400, {"err": "n"})
             path = {"server": f"{LOG}/server-{st['mode']}.log", "download": f"{LOG}/download.log", "boot": f"{LOG}/boot.log",
-                    "bootstrap": f"{LOG}/bootstrap.log", "server-frspec": f"{LOG}/server-frspec.log", "server-plain": f"{LOG}/server-plain.log"}.get(f)
+                    "bootstrap": f"{LOG}/bootstrap.log", "server-frspec": f"{LOG}/server-frspec.log",
+                    "server-plain": f"{LOG}/server-plain.log", "server-27b": f"{LOG}/server-27b.log"}.get(f)
             self.out(200 if path else 400, {"f": f, "text": tail(path, n) if path else "bad f"})
         elif u.path == "/smi":
             try: r = subprocess.run(["nvidia-smi"], capture_output=True, text=True, timeout=20); t = r.stdout + r.stderr
@@ -261,36 +346,55 @@ class H(http.server.BaseHTTPRequestHandler):
         u = urllib.parse.urlparse(self.path); q = urllib.parse.parse_qs(u.query)
         if u.path == "/mode":
             m = q.get("m", [""])[0]
-            if m not in ("frspec", "plain"): return self.out(400, {"err": "m"})
+            if m not in ("frspec", "plain", "27b"): return self.out(400, {"err": "m"})
+            pin = model_27b()
+            if m == "27b" and st["active"] != pin: return self.out(409, {"err": "27b requires the 27B model"})
+            if m != "27b" and st["active"] == pin: return self.out(409, {"err": "27B model requires mode 27b"})
             if m == "frspec" and not tok_ok(st["active"]): return self.out(409, {"err": "tokenizer fails FR-Spec check"})
             with lock:
                 stop(); st["mode"] = m; atomic_write(C + "/mode", m); save_cfg(); apply_runtime()
-                if complete(st["active"]): launch()
+                ready = complete(st["active"]) and (m != "27b" or complete(draft_27b()))
+                if ready: launch()
             self.out(200, {"mode": m, "pid": st["proc"] and st["proc"].pid})
         elif u.path == "/switch":
-            spec = q.get("model", [""])[0]; m = q.get("m", [st["mode"]])[0]
-            err = valid(spec) or (None if m in ("frspec", "plain") else "bad m")
+            spec = q.get("model", [""])[0]; m = q.get("m", [None])[0]
+            if m is None: m = "27b" if spec == model_27b() else st["mode"]
+            err = valid(spec) or (None if m in ("frspec", "plain", "27b") else "bad m")
+            if not err and not mode_fits(spec, m): err = "mode does not match model"
             if err: return self.out(400, {"err": err})
             if not start_job(spec, m): return self.out(409, {"err": "busy", "job": st["job"]})
             self.out(202, {"switching_to": spec, "mode": m, "downloaded": complete(spec)})
         elif u.path == "/config":
             m = q.get("m", [None])[0]; hs = q.get("hicache_gb", [None])[0]; cs = q.get("context", [None])[0]; model = q.get("model", [None])[0]
             if m is None and hs is None and cs is None and model is None: return self.out(400, {"err": "set m, hicache_gb, context, or model"})
-            if m is not None and m not in ("frspec", "plain"): return self.out(400, {"err": "m"})
-            if m == "frspec" and model is None and not tok_ok(st["active"]): return self.out(409, {"err": "tokenizer fails FR-Spec check"})
-            h_new, c_new = st["hicache_gb"], st["context"]
-            if hs is not None:
-                if not re.fullmatch(r"[1-9][0-9]{0,2}", hs): return self.out(400, {"err": "hicache_gb"})
-                h_new = int(hs); err = hicache_ok(h_new)
-                if err: return self.out(400, {"err": err})
-            if cs is not None:
-                if not re.fullmatch(r"[1-9][0-9]{0,6}", cs): return self.out(400, {"err": "context"})
-                c_new = int(cs); err = context_ok(c_new)
-                if err: return self.out(400, {"err": err})
-            mode = m or st["mode"]
+            if m is not None and m not in ("frspec", "plain", "27b"): return self.out(400, {"err": "m"})
+            pin = model_27b()
             if model is not None:
                 err = valid(model)
                 if err: return self.out(400, {"err": err})
+            if m == "frspec" and model is None and not tok_ok(st["active"]): return self.out(409, {"err": "tokenizer fails FR-Spec check"})
+            if model is not None and m is None and model == pin: mode = "27b"
+            else: mode = m or st["mode"]
+            if model is not None and not mode_fits(model, mode): return self.out(400, {"err": "mode does not match model"})
+            if model is None and m == "27b" and st["active"] != pin: return self.out(409, {"err": "27b requires the 27B model"})
+            if model is None and m in ("plain", "frspec") and st["active"] == pin: return self.out(409, {"err": "27B model requires mode 27b"})
+            h_new, c_new = st["hicache_gb"], st["context"]
+            if hs is not None:
+                if not re.fullmatch(r"0|[1-9][0-9]{0,2}" if mode == "27b" else r"[1-9][0-9]{0,2}", hs): return self.out(400, {"err": "hicache_gb"})
+                h_new = int(hs); err = hicache_ok(h_new, mode)
+                if err: return self.out(400, {"err": err})
+            if cs is not None:
+                if not re.fullmatch(r"[1-9][0-9]{0,6}", cs): return self.out(400, {"err": "context"})
+                c_new = int(cs); err = context_ok(c_new, mode)
+                if err: return self.out(400, {"err": err})
+            entering = mode == "27b" and st["mode"] != "27b"
+            leaving = mode != "27b" and st["mode"] == "27b"
+            if entering or leaving:
+                if cs is None and context_ok(c_new, mode): c_new = CONTEXT_27B_DEFAULT if mode == "27b" else 524288
+                if hs is None and hicache_ok(h_new, mode):
+                    if mode == "27b": h_new = hicache_cap_27b()
+                    else:
+                        cap = hicache_max(); h_new = cap if cap >= 8 else 8
             with lock:
                 if st["job"]: return self.out(409, {"err": "busy", "job": st["job"]})
                 st.update(hicache_gb=h_new, context=c_new)

@@ -63,14 +63,16 @@ Model pinned: `jpezzulli/OrcaRouter-Qwen3.8-Flash-Next-Uncensored-ModelOpt-NVFP4
   `xhigh` when it is unset, which becomes `--default-chat-template-kwargs` with `reasoning_effort=xhigh`.
   A request that sends `reasoning_effort` still overrides that server default. An explicit
   `PENNY_REASONING_EFFORT` in the environment (for example `low`) still wins over `xhigh`.
+- Mode `27b` writes `start-27b.sh` only. `start-plain.sh` and `start-frspec.sh` stay the Flash-Next
+  scripts, and Flash-Next still refuses rented RAM under 108 GB. See below.
 - API key: SGLang prints server_args with `api_key` in clear. ctl.py reads SGLang stdout/stderr through a pipe and replaces
   the key with `<API_KEY>` before it reaches the container log (`vastai logs`), /cache/logs or /log. Residual: the key is
   in SGLang's argv inside the container and in the Vast instance env (visible to whoever holds the Vast account).
 
 ## ctl.py (Bearer PENNY_API_KEY on every endpoint)
-GET `/status`, `/models`, `/log?f=server|download|boot|bootstrap|server-frspec|server-plain&n=80`, `/smi`;
-POST `/mode?m=frspec|plain`, `/switch?model=<org/repo@40-hex>[&m=plain|frspec]`,
-`/config?m=plain|frspec&hicache_gb=8..(PENNY_RAM_GB-100)&context=65536|131072|262144|524288&model=<org/repo@40-hex>`,
+GET `/status`, `/models`, `/log?f=server|download|boot|bootstrap|server-frspec|server-plain|server-27b&n=80`, `/smi`;
+POST `/mode?m=frspec|plain|27b`, `/switch?model=<org/repo@40-hex>[&m=plain|frspec|27b]`,
+`/config?m=plain|frspec|27b&hicache_gb=8..(PENNY_RAM_GB-100)&context=65536|131072|262144|524288&model=<org/repo@40-hex>`,
 `/upgrade?ref=vN.N` (optional patch, `vN.N.N`).
 Model must be in `models.allow` (strict regex, model dir confined to the models root, disk checked before download;
 the old server keeps serving until the new model is ready). HiCache above `PENNY_RAM_GB-100` is rejected
@@ -139,6 +141,47 @@ Vast cannot inject one). You manage the machine over the tailnet and ctl (`tcp/8
 restores the good scripts, and starts them. The log line says `rolled back to <ref>` and `no recycle`. The model
 files are not in the script snapshot, so they are not downloaded again. `vastai logs <instance_id>` shows the WARN.
 To retry a fixed tag: `POST /upgrade?ref=v5.x`, then `vastai reboot instance <id>`.
+
+## 27B on one RTX 5090
+
+`PENNY_MODE=27b` serves Qwen3.8-27B on one RTX 5090 (sm_120, 32607 MiB, 31.843 GiB). Host RAM on that
+offer can be about 31 GB, so the host HiCache pool stays off. Flash-Next is a different mode and still
+uses `start-plain.sh` / `start-frspec.sh`.
+
+Pinned target (not TBD): `Ar4ikov/Qwen3.8-27B-Uncensored-AWQ-W4A16-ASYM@d07667d03a5dbfebd02a4eaa55348b97f35d1935`,
+AWQ W4A16 asymmetric group 128 (`compressed-tensors`) of `orcarouter/Qwen3.8-27B-Uncensored`. Weight files
+19,547,867,688 bytes (18.205 GiB). HF 2026-10-21. Override with `PENNY_27B_MODEL` only when that spec is
+in `models.allow`. Draft, downloaded with it and not a `/switch` target:
+`incoai/Qwen3.8-27B-DFlash2@015e795645c74b1a0eeef3b570031fb62e769bc5`, unquant BF16, weight files
+3,848,817,896 bytes (3.584 GiB). `PENNY_27B_DRAFT` may replace it. `orcarouter` FP8 plus this draft is
+32.332 GiB of weights, over the card. The same base as NVFP4 is 26.577 GiB of weights; with the GDN
+state and a graph reserve it leaves about 51264 KV tokens, so the AWQ checkpoint is the one that fits.
+
+Budget, binary GiB, fp8 KV = 16 full-attention layers × 2 × 4 KV heads × 256 × 1 = 32768 bytes/token.
+GDN state per slot = 48 linear layers × (48×128×128×4 + 10240×3×2) = 146.8125 MiB. Draft KV is the
+decode window, 4 requests × 2048 × 10240 = 80 MiB, not the full context.
+
+| piece | size |
+| --- | --- |
+| card | 32607 MiB = 31.843 GiB |
+| static pool at `--mem-fraction-static 0.86` | 27.385 GiB |
+| left for graphs | 4.458 GiB |
+| AWQ weights + DFlash2 weights | 21.790 GiB |
+| 8 GDN slots (`--max-mamba-cache-size 8`) | 1.147 GiB |
+| draft KV window | 80 MiB |
+| fragmentation slack | 512 MiB |
+| left for target KV | 3.870 GiB = 126806 tokens |
+
+Page size is 64, so the context is **126784** (`--context-length` and `--max-total-tokens`). Smaller
+allowed values: 32768, 65536, 98304. YaRN factor 2.0 is injected only when context is 524288, which
+this card does not use. DFlash stays `--speculative-algorithm DFLASH`, 8 draft tokens, window 2048,
+draft quant `unquant`. NIXL stays off. Reasoning default stays `xhigh`.
+
+HiCache: rented RAM under 108 GB, or `PENNY_RAM_GB` missing, forces `PENNY_27B_HICACHE_GB=0` (the
+start file's default is 0). At 108 GB or more the cap is `min(96, PENNY_RAM_GB-100)`, and 0 is still
+legal. The upstream 96 GB pool is not allocated on a 31 GB machine. Other knobs:
+`PENNY_27B_CONTEXT_LENGTH`, `PENNY_27B_QUANTIZATION` (default `compressed-tensors`),
+`PENNY_27B_MEM_FRACTION` (default `0.86`), `PENNY_27B_MAMBA_SLOTS` (default `8`).
 
 ## Tests (no GPU / no real model)
 `bash test/run_sim.sh <fakeroot> <tokenizer.json>` - fakeroot = upstream `configs/pennyroyal/` of pennyroyal-v3.0.2 in a git
