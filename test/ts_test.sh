@@ -108,4 +108,25 @@ if [[ $rc == 0 ]] && grep -q "27B HiCache off" "$W/out.log" && grep -q "context 
   && [[ $gp == "$PLAIN_SHA" && $gf == "$FR_SHA" ]] && bash -n "$s27"; then
   echo "PASS ts 27b: HiCache off, context 126784, quant/draft/mem/mamba/xhigh, flash sha unchanged"; PASS=$((PASS+1))
 else echo "FAIL ts 27b"; FAIL=$((FAIL+1)); fi
+# Flash-Next bakes the name "$PENNY_API_KEY", not the value. Two placeholders must
+# match the pre-PR sha256, and the placeholder text must not appear in the files.
+for key in placeholder-not-a-real-key second-placeholder; do
+  W=$(mktemp -d /tmp/pv5ts.XXXX); C=$W/cache; mkdir -p "$C"
+  PENNY_CACHE=$C PENNY_API_KEY=$key PENNY_RAM_GB=189 PENNY_PY=true timeout 30 bash "$BOOT" > "$W/out.log" 2>&1; rc=$?
+  gp=$(sha256sum "$C/start-plain.sh" | awk 'NR==1{print $1}'); gf=$(sha256sum "$C/start-frspec.sh" | awk 'NR==1{print $1}')
+  echo "[api_key $key] rc=$rc plain=$gp frspec=$gf"
+  if [[ $rc == 0 && $gp == "$PLAIN_SHA" && $gf == "$FR_SHA" ]] \
+    && grep -qF -- '--api-key "$PENNY_API_KEY"' "$C/start-plain.sh" \
+    && grep -qF -- '--api-key "$PENNY_API_KEY"' "$C/start-frspec.sh" \
+    && ! grep -qF -- "$key" "$C/start-plain.sh" "$C/start-frspec.sh"; then
+    echo "PASS ts api-key $key: flash scripts match pre-PR sha and omit the key value"; PASS=$((PASS+1))
+  else echo "FAIL ts api-key $key"; FAIL=$((FAIL+1)); fi
+done
+# No key: boot stops before it writes a start file, so there is no second variant.
+W=$(mktemp -d /tmp/pv5ts.XXXX); C=$W/cache; mkdir -p "$C"
+env -u PENNY_API_KEY PENNY_CACHE=$C PENNY_RAM_GB=189 PENNY_PY=true timeout 30 bash "$BOOT" > "$W/out.log" 2>&1; rc=$?
+echo "[api_key unset] rc=$rc files=$( [[ -f $C/start-plain.sh || -f $C/start-frspec.sh ]] && echo present || echo absent )"
+if [[ $rc != 0 && ! -f $C/start-plain.sh && ! -f $C/start-frspec.sh ]] && grep -q 'PENNY_API_KEY' "$W/out.log"; then
+  echo "PASS ts api-key unset: no flash start file written"; PASS=$((PASS+1))
+else echo "FAIL ts api-key unset"; FAIL=$((FAIL+1)); fi
 echo "=== TS RESULT: $PASS passed, $FAIL failed"
